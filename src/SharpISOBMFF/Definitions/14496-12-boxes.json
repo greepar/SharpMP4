@@ -524,7 +524,7 @@
       "type": "FullBox",
       "versions": [ 0, 1 ],
       "flags": [],
-      "syntax": "aligned(8) class CompositionOffsetBox\r\n\textends FullBox('ctts', version, 0) {\r\n\tunsigned int(32)\tentry_count;\r\n\t\tint i;\r\n\tif (version==0) {\r\n\t\tfor (i=0; i < entry_count; i++) {\r\n\t\t\tunsigned int(32)\tsample_count;\r\n\t\t\tunsigned int(32)\tsample_offset;\r\n\t\t}\r\n\t}\r\n\telse if (version == 1) {\r\n\t\tfor (i=0; i < entry_count; i++) {\r\n\t\t\tunsigned int(32)\tsample_count;\r\n\t\t\tsigned   int(32)\tsample_offset;\r\n\t\t}\r\n\t}\r\n}"
+      "syntax": "aligned(8) class CompositionOffsetBox\r\n\textends FullBox('ctts', version, 0) {\r\n\tunsigned int(32)\tentry_count;\r\n\t\tint i;\r\n\tfor (i=0; i < entry_count; i++) {\r\n\t\tunsigned int(32)\tsample_count;\r\n\t\tif (version==0) {\r\n\t\t\tunsigned int(32)\tsample_offset;\r\n\t\t}\r\n\t\telse if (version == 1) {\r\n\t\t\tsigned   int(32)\tsample_offset;\r\n\t\t}\r\n\t}\r\n}"
     },
     {
       "fourcc": "dinf",

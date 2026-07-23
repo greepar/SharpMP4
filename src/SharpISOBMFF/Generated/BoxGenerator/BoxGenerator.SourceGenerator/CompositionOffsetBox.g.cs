@@ -10,15 +10,12 @@ aligned(8) class CompositionOffsetBox
 	extends FullBox('ctts', version, 0) {
 	unsigned int(32)	entry_count;
 		int i;
-	if (version==0) {
-		for (i=0; i < entry_count; i++) {
-			unsigned int(32)	sample_count;
+	for (i=0; i < entry_count; i++) {
+		unsigned int(32)	sample_count;
+		if (version==0) {
 			unsigned int(32)	sample_offset;
 		}
-	}
-	else if (version == 1) {
-		for (i=0; i < entry_count; i++) {
-			unsigned int(32)	sample_count;
+		else if (version == 1) {
 			signed   int(32)	sample_offset;
 		}
 	}
@@ -52,25 +49,30 @@ public partial class CompositionOffsetBox : FullBox
 		boxSize += stream.ReadUInt32(boxSize, readSize,  out this.entry_count, "entry_count"); 
 		
 
+		this.sample_count = new uint[IsoStream.GetInt( entry_count)];
 		if (version==0)
 		{
 
-			this.sample_count = new uint[IsoStream.GetInt( entry_count)];
 			this.sample_offset = new uint[IsoStream.GetInt( entry_count)];
-			for (int i=0; i < entry_count; i++)
-			{
-				boxSize += stream.ReadUInt32(boxSize, readSize,  out this.sample_count[i], "sample_count"); 
-				boxSize += stream.ReadUInt32(boxSize, readSize,  out this.sample_offset[i], "sample_offset"); 
-			}
 		}
 
 		else if (version == 1)
 		{
 
 			this.sample_offset0 = new int[IsoStream.GetInt( entry_count)];
-			for (int i=0; i < entry_count; i++)
+		}
+		for (int i=0; i < entry_count; i++)
+		{
+			boxSize += stream.ReadUInt32(boxSize, readSize,  out this.sample_count[i], "sample_count");
+			if (version==0)
 			{
-				boxSize += stream.ReadUInt32(boxSize, readSize,  out this.sample_count[i], "sample_count"); 
+
+				boxSize += stream.ReadUInt32(boxSize, readSize,  out this.sample_offset[i], "sample_offset");
+			}
+
+			else if (version == 1)
+			{
+
 				boxSize += stream.ReadInt32(boxSize, readSize,  out this.sample_offset0[i], "sample_offset0"); 
 			}
 		}
@@ -84,22 +86,18 @@ public partial class CompositionOffsetBox : FullBox
 		boxSize += stream.WriteUInt32( this.entry_count, "entry_count"); 
 		
 
-		if (version==0)
+		for (int i=0; i < entry_count; i++)
 		{
-
-			for (int i=0; i < entry_count; i++)
+			boxSize += stream.WriteUInt32( this.sample_count[i], "sample_count");
+			if (version==0)
 			{
-				boxSize += stream.WriteUInt32( this.sample_count[i], "sample_count"); 
+
 				boxSize += stream.WriteUInt32( this.sample_offset[i], "sample_offset"); 
 			}
-		}
 
-		else if (version == 1)
-		{
-
-			for (int i=0; i < entry_count; i++)
+			else if (version == 1)
 			{
-				boxSize += stream.WriteUInt32( this.sample_count[i], "sample_count"); 
+
 				boxSize += stream.WriteInt32( this.sample_offset0[i], "sample_offset0"); 
 			}
 		}
@@ -113,22 +111,18 @@ public partial class CompositionOffsetBox : FullBox
 		boxSize += 32; // entry_count
 		
 
-		if (version==0)
+		for (int i=0; i < entry_count; i++)
 		{
-
-			for (int i=0; i < entry_count; i++)
+			boxSize += 32; // sample_count
+			if (version==0)
 			{
-				boxSize += 32; // sample_count
+
 				boxSize += 32; // sample_offset
 			}
-		}
 
-		else if (version == 1)
-		{
-
-			for (int i=0; i < entry_count; i++)
+			else if (version == 1)
 			{
-				boxSize += 32; // sample_count
+
 				boxSize += 32; // sample_offset0
 			}
 		}
