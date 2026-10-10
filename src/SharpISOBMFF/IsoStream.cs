@@ -2367,6 +2367,9 @@ namespace SharpISOBMFF
 
         private void LogBegin(string name)
         {
+            if (!Logger.IsInfoEnabled || Logger is DefaultMp4Logger { IsLoggingEnabled: false })
+                return;
+
             var padding = new StringBuilder();
             for (int i = 0; i < _logLevel; i++)
             {
@@ -2378,6 +2381,9 @@ namespace SharpISOBMFF
 
         private void LogEnd<T>(string name, ulong size, T value)
         {
+            if (!Logger.IsInfoEnabled || Logger is DefaultMp4Logger { IsLoggingEnabled: false })
+                return;
+
             if (string.IsNullOrEmpty(name))
                 return;
 
