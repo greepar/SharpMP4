@@ -19,7 +19,11 @@ namespace SharpMP4.Builders
             public ulong EndTime { get; set; }
             public List<uint> SampleSizes { get; set; } = new List<uint>();
             public List<uint> SampleOffsets { get; set; } = new List<uint>();
+            public List<uint> SampleDurations { get; set; } = new List<uint>();
+            public List<long> CompositionOffsets { get; set; } = new List<long>();
             public List<uint> RandomAccessPoints { get; set; } = new List<uint>();
+            public long PresentationStart { get; set; } = long.MaxValue;
+            public long PresentationEnd { get; set; } = long.MinValue;
 
             public TrackContext(ITrack track)
             {
@@ -74,24 +78,58 @@ namespace SharpMP4.Builders
             return trackID;
         }
 
-        private void WriteSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint)
+        private void WriteSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint, long compositionTimeOffset)
         {
+            var track = _trackContexts[trackID];
+            int resolvedSampleDuration = sampleDuration <= 0 ? track.Track.DefaultSampleDuration : sampleDuration;
+            if (resolvedSampleDuration <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(sampleDuration), "Sample duration must resolve to a positive value.");
+            }
+
             if (_storage == null)
             {
                 _storage = this.TemporaryStorageFactory.Create();
             }
 
-            uint currentSampleDuration = sampleDuration <= 0 ? (uint)_trackContexts[trackID].Track.DefaultSampleDuration : (uint)sampleDuration;
-            var track = _trackContexts[trackID];
+            uint currentSampleDuration = (uint)resolvedSampleDuration;
             track.SampleOffsets.Add((uint)_storage.GetPosition());
             _storage.Write(sample, 0, sample.Length);
             track.SampleSizes.Add((uint)sample.Length);
-            track.EndTime += currentSampleDuration;
+            track.SampleDurations.Add(currentSampleDuration);
+            track.CompositionOffsets.Add(compositionTimeOffset);
+            long presentationTime = checked((long)track.EndTime + compositionTimeOffset);
+            track.PresentationStart = Math.Min(track.PresentationStart, presentationTime);
+            track.PresentationEnd = Math.Max(track.PresentationEnd, checked(presentationTime + currentSampleDuration));
+            track.EndTime = checked(track.EndTime + currentSampleDuration);
 
             if(isRandomAccessPoint)
             {
                 track.RandomAccessPoints.Add((uint)track.SampleSizes.Count);
             }
+        }
+
+        private static ulong RescaleCeiling(ulong value, uint sourceTimescale, uint destinationTimescale)
+        {
+            if (sourceTimescale == 0)
+                throw new ArgumentOutOfRangeException(nameof(sourceTimescale));
+            if (destinationTimescale == 0)
+                throw new ArgumentOutOfRangeException(nameof(destinationTimescale));
+
+            ulong quotient = value / sourceTimescale;
+            ulong remainder = value % sourceTimescale;
+            ulong scaledRemainder = checked(remainder * destinationTimescale);
+            ulong roundedRemainder = scaledRemainder == 0 ? 0 : (scaledRemainder - 1) / sourceTimescale + 1;
+            return checked(checked(quotient * destinationTimescale) + roundedRemainder);
+        }
+
+        private static ulong GetPresentationDuration(TrackContext track)
+        {
+            if (track.PresentationStart == long.MaxValue)
+                return 0;
+
+            long mediaStart = Math.Max(0, track.PresentationStart);
+            return checked((ulong)Math.Max(0, track.PresentationEnd - mediaStart));
         }
 
         private MovieBox BuildMoov()
@@ -103,18 +141,18 @@ namespace SharpMP4.Builders
             moov.Children = new List<Box>();
             moov.Children.Add(mvhd);
 
-            // maximum duration of all the tracks
             ulong movieDuration = 0;
             foreach(var track in _trackContexts.Values)
             {
-                ulong trackDuration = (ulong)Math.Ceiling(track.EndTime * 1000 / (double)track.Track.Timescale);
+                ulong trackDuration = RescaleCeiling(GetPresentationDuration(track), track.Track.Timescale, MovieTimescale);
                 if (trackDuration > movieDuration)
                 {
                     movieDuration = trackDuration;
                 }
             }
 
-            mvhd.Duration = movieDuration * MovieTimescale / 1000;
+            mvhd.Version = movieDuration > uint.MaxValue ? (byte)1 : (byte)0;
+            mvhd.Duration = movieDuration;
             mvhd.NextTrackID = 0xFFFFFFFF;
             mvhd.Timescale = MovieTimescale; // just for movie time: https://stackoverflow.com/questions/77803940/diffrence-between-mvhd-box-timescale-and-mdhd-box-timescale-in-isobmff-format
             mvhd.Reserved0 = new uint[2]; // TODO simplify API
@@ -142,7 +180,29 @@ namespace SharpMP4.Builders
                     tkhd.Flags = 0x01 | 0x02;
                 }
                 track.Track.FillTkhdBox(tkhd);
-                tkhd.Duration = movieDuration * MovieTimescale / 1000;
+                tkhd.Duration = RescaleCeiling(GetPresentationDuration(track), track.Track.Timescale, MovieTimescale);
+                tkhd.Version = tkhd.Duration > uint.MaxValue ? (byte)1 : (byte)0;
+
+                long mediaStart = Math.Max(0, track.PresentationStart);
+                if (mediaStart > 0)
+                {
+                    var edts = new EditBox();
+                    edts.SetParent(trak);
+                    edts.Children = new List<Box>();
+                    trak.Children.Add(edts);
+
+                    bool useVersion1 = tkhd.Duration > uint.MaxValue || mediaStart > int.MaxValue;
+                    var elst = new EditListBox(useVersion1 ? (byte)1 : (byte)0)
+                    {
+                        EntryCount = 1,
+                        EditDuration = new[] { tkhd.Duration },
+                        MediaTime = new[] { mediaStart },
+                        MediaRateInteger = new short[] { 1 },
+                        MediaRateFraction = new short[] { 0 }
+                    };
+                    elst.SetParent(edts);
+                    edts.Children.Add(elst);
+                }
 
                 var mdia = new MediaBox();
                 mdia.SetParent(trak);
@@ -152,7 +212,8 @@ namespace SharpMP4.Builders
                 mdhd.SetParent(mdia);
                 mdia.Children = new List<Box>();
                 mdia.Children.Add(mdhd);
-                mdhd.Duration = movieDuration * track.Track.Timescale / 1000;
+                mdhd.Duration = track.EndTime;
+                mdhd.Version = mdhd.Duration > uint.MaxValue ? (byte)1 : (byte)0;
                 mdhd.Timescale = track.Track.Timescale;
                 mdhd.Language = track.Track.Language;
 
@@ -232,9 +293,56 @@ namespace SharpMP4.Builders
                 var stts = new TimeToSampleBox();
                 stts.SetParent(stbl);
                 stbl.Children.Add(stts);
-                stts.SampleCount = new uint[] { (uint)track.SampleOffsets.Count };
-                stts.SampleDelta = new uint[] { (uint)(track.EndTime / (uint)Math.Max(1, track.SampleSizes.Count)) };
+                var sttsSampleCounts = new List<uint>();
+                var sttsSampleDeltas = new List<uint>();
+                foreach (uint duration in track.SampleDurations)
+                {
+                    if (sttsSampleDeltas.Count > 0 && sttsSampleDeltas[sttsSampleDeltas.Count - 1] == duration)
+                    {
+                        sttsSampleCounts[sttsSampleCounts.Count - 1] = checked(sttsSampleCounts[sttsSampleCounts.Count - 1] + 1);
+                    }
+                    else
+                    {
+                        sttsSampleCounts.Add(1);
+                        sttsSampleDeltas.Add(duration);
+                    }
+                }
+                stts.SampleCount = sttsSampleCounts.ToArray();
+                stts.SampleDelta = sttsSampleDeltas.ToArray();
                 stts.EntryCount = (uint)stts.SampleCount.Length;
+
+                if (track.CompositionOffsets.Any(offset => offset != 0))
+                {
+                    var cttsSampleCounts = new List<uint>();
+                    var cttsSampleOffsets = new List<long>();
+                    foreach (long offset in track.CompositionOffsets)
+                    {
+                        if (cttsSampleOffsets.Count > 0 && cttsSampleOffsets[cttsSampleOffsets.Count - 1] == offset)
+                        {
+                            cttsSampleCounts[cttsSampleCounts.Count - 1] = checked(cttsSampleCounts[cttsSampleCounts.Count - 1] + 1);
+                        }
+                        else
+                        {
+                            cttsSampleCounts.Add(1);
+                            cttsSampleOffsets.Add(offset);
+                        }
+                    }
+
+                    bool hasNegativeOffset = cttsSampleOffsets.Any(offset => offset < 0);
+                    var ctts = new CompositionOffsetBox(hasNegativeOffset ? (byte)1 : (byte)0);
+                    ctts.SetParent(stbl);
+                    stbl.Children.Add(ctts);
+                    ctts.SampleCount = cttsSampleCounts.ToArray();
+                    ctts.EntryCount = (uint)ctts.SampleCount.Length;
+                    if (hasNegativeOffset)
+                    {
+                        ctts.SampleOffset0 = cttsSampleOffsets.Select(offset => checked((int)offset)).ToArray();
+                    }
+                    else
+                    {
+                        ctts.SampleOffset = cttsSampleOffsets.Select(offset => checked((uint)offset)).ToArray();
+                    }
+                }
 
                 if (track.Track.HandlerType == HandlerTypes.Video)
                 {
@@ -283,7 +391,12 @@ namespace SharpMP4.Builders
 
         public void ProcessRawSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint)
         {
-            WriteSample(trackID, sample, sampleDuration, isRandomAccessPoint);
+            ProcessRawSample(trackID, sample, sampleDuration, isRandomAccessPoint, 0);
+        }
+
+        public void ProcessRawSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint, long compositionTimeOffset)
+        {
+            WriteSample(trackID, sample, sampleDuration, isRandomAccessPoint, compositionTimeOffset);
         }
 
         public void FinalizeMedia()

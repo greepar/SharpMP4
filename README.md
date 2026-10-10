@@ -76,6 +76,16 @@ When done, call `FinalizeMedia` to create the video file:
 ```cs
 outputBuilder.FinalizeMedia();
 ```
+
+To repeat an existing MP4 video track until an MP4 audio track ends, without re-encoding either track:
+```cs
+using var video = File.OpenRead("short-video.mp4");
+using var audio = File.OpenRead("music.m4a");
+using var output = File.Create("looped-with-audio.mp4");
+LoopingVideoAudioMuxer.Mux(video, audio, output);
+```
+The input streams must be seekable, and the video must start with a keyframe. This only remuxes existing encoded samples; it does not turn a still image or an MP3 file into MP4 media.
+
 ## Extensibility
 ### Logging
 There is an `IMp4Logger` interface exposed on the `Mp4Builder`, `FragmentedMp4Builder`, `VideoReader` and `ImageReader` instances where you can supply your own logger implementation, or use an existing one:

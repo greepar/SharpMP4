@@ -3,6 +3,7 @@ using SharpMP4.Tracks;
 using SharpMP4.Common;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 
 namespace SharpMP4.Readers
@@ -320,13 +321,7 @@ namespace SharpMP4.Readers
         {
             var trackContext = this.Tracks[trackID];
 
-            int sttsIndex = 0;
-            uint sttsNextRun = 0;
             uint sttsSampleDelta = 0;
-
-            int cttsIndex = 0;
-            uint cttsNextRun = 0;
-            int cttsSampleDelta = 0;
 
             uint sampleIndex = trackContext.SampleIndex;
             if (trackContext.SizesList.Length <= sampleIndex)
@@ -360,53 +355,49 @@ namespace SharpMP4.Readers
             }
 
             long dts = 0;
-            while (sampleIndex > sttsNextRun)
+            uint remainingSamples = sampleIndex;
+            bool foundSttsRun = false;
+            for (int sttsIndex = 0; sttsIndex < trackContext.Stts.SampleCount.Length; sttsIndex++)
             {
                 sttsSampleDelta = trackContext.Stts.SampleDelta[sttsIndex];
-                uint sampleCount = 0;
-                if (sttsIndex < trackContext.Stts.SampleCount.Length)
-                    sampleCount = trackContext.Stts.SampleCount[sttsIndex];
-                sttsIndex += 1;
-
-                uint sttsPreviousRun = sttsNextRun;
-                sttsNextRun += sampleCount;
-
-                if (sampleIndex >= sttsNextRun)
+                uint sampleCount = trackContext.Stts.SampleCount[sttsIndex];
+                if (remainingSamples < sampleCount)
                 {
-                    dts += sampleCount * sttsSampleDelta;
+                    dts = checked(dts + checked((long)remainingSamples * sttsSampleDelta));
+                    foundSttsRun = true;
+                    break;
                 }
-                else
-                {
-                    dts += (sampleIndex - sttsPreviousRun) * sttsSampleDelta;
-                }
+
+                dts = checked(dts + checked((long)sampleCount * sttsSampleDelta));
+                remainingSamples -= sampleCount;
             }
+            if (!foundSttsRun)
+                throw new InvalidDataException($"Sample {sampleIndex} is not covered by the stts box.");
 
+            long compositionTimeOffset = 0;
             if (trackContext.Ctts != null)
             {
-                while (sampleIndex >= cttsNextRun)
+                remainingSamples = sampleIndex;
+                bool foundCttsRun = false;
+                for (int cttsIndex = 0; cttsIndex < trackContext.Ctts.SampleCount.Length; cttsIndex++)
                 {
-                    if (trackContext.Ctts.Version == 0)
-                        cttsSampleDelta = (int)trackContext.Ctts.SampleOffset[cttsIndex];
-                    else
-                        cttsSampleDelta = trackContext.Ctts.SampleOffset0[cttsIndex];
-
-                    uint sampleCount = 0;
-                    if (cttsIndex < trackContext.Ctts.SampleCount.Length)
-                        sampleCount = trackContext.Ctts.SampleCount[cttsIndex];
-                    cttsIndex += 1;
-
-                    var cttsPreviousRun = cttsNextRun;
-                    cttsNextRun += sampleCount;
-
-                    if (sampleIndex >= cttsNextRun)
+                    uint sampleCount = trackContext.Ctts.SampleCount[cttsIndex];
+                    if (remainingSamples < sampleCount)
                     {
-                        dts += sampleCount * cttsSampleDelta;
+                        compositionTimeOffset = trackContext.Ctts.Version switch
+                        {
+                            0 => trackContext.Ctts.SampleOffset[cttsIndex],
+                            1 => trackContext.Ctts.SampleOffset0[cttsIndex],
+                            _ => throw new InvalidDataException($"Unsupported ctts version {trackContext.Ctts.Version}.")
+                        };
+                        foundCttsRun = true;
+                        break;
                     }
-                    else
-                    {
-                        dts += (sampleIndex - cttsPreviousRun) * cttsSampleDelta;
-                    }
+
+                    remainingSamples -= sampleCount;
                 }
+                if (!foundCttsRun)
+                    throw new InvalidDataException($"Sample {sampleIndex} is not covered by the ctts box.");
             }
 
             bool isRandomAccessPoint = true;
@@ -416,7 +407,7 @@ namespace SharpMP4.Readers
             }
 
             uint sampleSize = trackContext.SizesList[sampleIndex];
-            long pts = dts + cttsSampleDelta;
+            long pts = checked(dts + compositionTimeOffset);
 
             if (this.Mdat.Data.Stream.GetCurrentOffset() != startAddress)
             {
@@ -451,10 +442,6 @@ namespace SharpMP4.Readers
             var trun = trackContext.Truns[trackContext.FragmentSampleTrunIndex[trackContext.SampleIndex]];
             int trunEntryIndex = trackContext.FragmentSampleTrunEntryIndex[trackContext.SampleIndex];
 
-            uint firstSampleFlags = trun.FirstSampleFlags;
-            if ((trun.Flags & 0x4) != 0x4)
-                firstSampleFlags = trackContext.Tfhd.DefaultSampleFlags;
-
             var entry = trun._TrunEntry[trunEntryIndex];
 
             uint sampleDuration = trackContext.Tfhd.DefaultSampleDuration;
@@ -478,8 +465,8 @@ namespace SharpMP4.Readers
                 throw new Exception("Cannot get sample size");
 
             uint sampleFlags = trackContext.Tfhd.DefaultSampleFlags;
-            if (trunEntryIndex == 0)
-                sampleFlags = firstSampleFlags;
+            if (trunEntryIndex == 0 && (trun.Flags & 0x4) == 0x4)
+                sampleFlags = trun.FirstSampleFlags;
             else if ((entry.Flags & 0x400) == 0x400)
                 sampleFlags = entry.SampleFlags;
 
@@ -505,7 +492,8 @@ namespace SharpMP4.Readers
             ulong size = trackContext.Mdat.Data.Stream.ReadBytes(sampleSize, out byte[] sampleData);
                         
             trackContext.SampleIndex++;
-            return new MediaSample(pts, dts, (int)sampleDuration, sampleData);
+            bool isRandomAccessPoint = (sampleFlags & 0x00010000) == 0;
+            return new MediaSample(pts, dts, (int)sampleDuration, sampleData, isRandomAccessPoint);
         }
 
         public IEnumerable<byte[]> ParseSample(uint trackID, byte[] sample)
