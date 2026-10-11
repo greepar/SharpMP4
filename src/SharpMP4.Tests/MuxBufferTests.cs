@@ -9,10 +9,10 @@ namespace SharpMP4.Tests;
 public class MuxBufferTests
 {
     [Fact]
-    public void LoopingMuxPreservesVariableSizePayloadsTimingAndFinalClipping()
+    public void LoopingMuxPreservesThreeLoopsVariablePayloadsAndAudioClipping()
     {
         using var video = CreateInput(HandlerTypes.Video, [2, 3, 2], [5, 2, 4], [1, -1, 0]);
-        using var audio = CreateInput("soun", [7, 8, 5], [1, 4, 2], [0, 0, 0]);
+        using var audio = CreateInput("soun", [7, 8, 9], [1, 4, 2], [0, 0, 0]);
         using var output = new MemoryStream();
         LoopingVideoAudioMuxer.Mux(video, audio, output);
         output.Position = 0;
@@ -22,7 +22,7 @@ public class MuxBufferTests
         reader.Parse(container);
         var videoTrack = reader.GetTracks().Single(t => t.HandlerType == HandlerTypes.Video);
         var audioTrack = reader.GetTracks().Single(t => t.HandlerType == "soun");
-        int[] expectedDurations = [2, 3, 2, 2, 3, 2, 2, 3, 1];
+        int[] expectedDurations = [2, 3, 2, 2, 3, 2, 2, 3, 2];
         long dts = 0;
         for (int i = 0; i < expectedDurations.Length; i++)
         {
@@ -34,12 +34,12 @@ public class MuxBufferTests
             Assert.Equal(Enumerable.Repeat((byte)(i % 3 + 1), new[] { 5, 2, 4 }[i % 3]), sample.Data);
             dts += sample.Duration;
         }
-        Assert.Equal(20, dts);
+        Assert.Equal(21, dts);
         Assert.Null(reader.ReadSample(videoTrack.TrackID));
         for (int i = 0; i < 3; i++)
         {
             var sample = reader.ReadSample(audioTrack.TrackID);
-            Assert.Equal(new[] { 7, 8, 5 }[i], sample.Duration);
+            Assert.Equal(new[] { 7, 8, 6 }[i], sample.Duration);
             Assert.Equal(Enumerable.Repeat((byte)(i + 1), new[] { 1, 4, 2 }[i]), sample.Data);
         }
         Assert.Null(reader.ReadSample(audioTrack.TrackID));

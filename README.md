@@ -101,14 +101,29 @@ When done, call `FinalizeMedia` to create the video file:
 outputBuilder.FinalizeMedia();
 ```
 
-To repeat an existing MP4 video track until an MP4 audio track ends, without re-encoding either track:
+To repeat an existing MP4 video three times with an MP4 audio track or a raw MP3 file, without re-encoding:
 ```cs
-using var video = File.OpenRead("short-video.mp4");
-using var audio = File.OpenRead("music.m4a");
+using var video = new BufferedStream(File.OpenRead("short-video.mp4"));
+using var audio = new BufferedStream(File.OpenRead("music.mp3")); // .m4a is also supported
 using var output = File.Create("looped-with-audio.mp4");
-LoopingVideoAudioMuxer.Mux(video, audio, output);
+LoopingVideoAudioMuxer.Mux(video, audio, output, loopCount: 3);
 ```
-The input streams must be seekable, and the video must start with a keyframe. This only remuxes existing encoded samples; it does not turn a still image or an MP3 file into MP4 media.
+Inputs must be seekable, and the video must start with a keyframe. Pass `null` for audio to repeat only the video, or `loopCount: 1` to play it once. Long audio is trimmed at the video end; short audio ends naturally while the video continues. This is entirely managed remuxing, without ffmpeg, native codecs, or PCM conversion. It does not animate still images.
+
+`MP3Reader` supports MPEG-1/2/2.5 Layer III, CBR/VBR, CRC-protected frames, ID3v2 tags (including v2.4 footers), ID3v1/APEv2 trailers, and Xing/Info/VBRI metadata frames. It reads sequentially and reuses the caller's frame buffer and the returned `MediaSample` instance; consume each sample before reading the next. Free-format MP3, malformed/truncated data, and changes of sample rate or channel count are rejected. Gapless encoder delay/padding metadata is not transferred to MP4 edit lists.
+
+An MP3-only MP4 can also be written with the normal builder:
+```cs
+var reader = new MP3Reader(audioStream);
+using var builder = new Mp4Builder(new SingleStreamOutput(outputStream));
+builder.AddTrack(reader.Track);
+byte[] buffer = null;
+MediaSample sample;
+while ((sample = reader.ReadSample(ref buffer, out var bytes)) != null)
+    builder.ProcessRawSample(reader.Track.TrackID, buffer, 0, bytes, sample.Duration, true, 0);
+builder.FinalizeMedia();
+```
+`MP3Track` uses `mp4a` with MPEG audio ES descriptor object types `0x6b` (MPEG-1) and `0x69` (MPEG-2/2.5), matching the [FFmpeg ISO media codec registry](https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/isom.c). `VideoReader` recognizes these tracks on round-trip reads. The output keeps the MP3 codec and original compressed frames; it does not convert audio to AAC.
 
 ## Extensibility
 ### Logging

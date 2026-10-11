@@ -10,54 +10,67 @@ using System.Threading;
 namespace SharpMP4.Builders
 {
     /// <summary>
-    /// Repeats the video samples of an MP4 until the end of an MP4 audio track.
+    /// Repeats an MP4 video a fixed number of times, optionally with an MP4 audio track or raw MP3 stream.
     /// Both inputs are remuxed without encoding; the first video sample must be a keyframe.
     /// </summary>
     public static class LoopingVideoAudioMuxer
     {
         public static void Mux(Stream videoStream, Stream audioStream, Stream outputStream,
             CancellationToken cancellationToken = default)
-        {
-            Mux(videoStream, audioStream, outputStream, cancellationToken, null);
-        }
+            => Mux(videoStream, audioStream, outputStream, cancellationToken, null, 3);
 
         public static void Mux(Stream videoStream, Stream audioStream, Stream outputStream,
             CancellationToken cancellationToken, ITemporaryStorageFactory temporaryStorageFactory)
+            => Mux(videoStream, audioStream, outputStream, cancellationToken, temporaryStorageFactory, 3);
+
+        public static void Mux(Stream videoStream, Stream audioStream, Stream outputStream,
+            int loopCount, CancellationToken cancellationToken = default,
+            ITemporaryStorageFactory temporaryStorageFactory = null)
+            => Mux(videoStream, audioStream, outputStream, cancellationToken, temporaryStorageFactory, loopCount);
+
+        public static void Mux(Stream videoStream, Stream audioStream, Stream outputStream,
+            CancellationToken cancellationToken, ITemporaryStorageFactory temporaryStorageFactory, int loopCount)
         {
             if (videoStream == null || !videoStream.CanSeek) throw new ArgumentException("Video input must be seekable.", nameof(videoStream));
-            if (audioStream == null || !audioStream.CanSeek) throw new ArgumentException("Audio input must be seekable.", nameof(audioStream));
+            if (audioStream != null && !audioStream.CanSeek) throw new ArgumentException("Audio input must be seekable.", nameof(audioStream));
             if (outputStream == null || !outputStream.CanWrite) throw new ArgumentException("Output must be writable.", nameof(outputStream));
 
+            if (loopCount < 1) throw new ArgumentOutOfRangeException(nameof(loopCount));
+            cancellationToken.ThrowIfCancellationRequested();
             var videoContainer = ReadContainer(videoStream, temporaryStorageFactory);
-            var audioContainer = ReadContainer(audioStream, temporaryStorageFactory);
+            var mp3Reader = audioStream != null && MP3Reader.IsMP3(audioStream) ? new MP3Reader(audioStream) : null;
+            var audioContainer = audioStream == null || mp3Reader != null ? null : ReadContainer(audioStream, temporaryStorageFactory);
             var videoReader = CreateReader(videoContainer);
-            var audioReader = CreateReader(audioContainer);
+            var audioReader = audioContainer == null ? null : CreateReader(audioContainer);
             var videoTrack = videoReader.GetTracks().FirstOrDefault(track => track.HandlerType == "vide")
                              ?? throw new InvalidDataException("Video input has no video track.");
-            var audioTrack = audioReader.GetTracks().FirstOrDefault(track => track.HandlerType == "soun")
-                             ?? throw new InvalidDataException("Audio input has no audio track.");
+            ITrack audioTrack = mp3Reader != null ? mp3Reader.Track
+                : audioReader?.GetTracks().FirstOrDefault(track => track.HandlerType == "soun");
+            if (audioStream != null && audioTrack == null) throw new InvalidDataException("Audio input has no audio track.");
             var videoMetadata = GetTrackMetadata(videoContainer, "vide", videoTrack);
-            var audioMetadata = GetTrackMetadata(audioContainer, "soun", audioTrack);
-            if (videoMetadata.Timescale == 0 || audioMetadata.Timescale == 0)
+            var audioMetadata = audioTrack == null ? null : mp3Reader != null
+                ? new TrackMetadata(null, audioTrack.Timescale, audioTrack.DefaultSampleDuration)
+                : GetTrackMetadata(audioContainer, "soun", audioTrack);
+            if (videoMetadata.Timescale == 0 || audioMetadata?.Timescale == 0)
                 throw new InvalidDataException("Input track has no timescale.");
 
-            long audioDuration = 0;
-            int audioSampleCount = 0;
-            MediaSample audioSample;
-            while ((audioSample = audioReader.ReadSample(audioTrack.TrackID, false)) != null)
+            long videoDuration = 0;
+            MediaSample measuredSample;
+            while ((measuredSample = videoReader.ReadSample(videoTrack.TrackID, false)) != null)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                audioSampleCount = checked(audioSampleCount + 1);
-                audioDuration = checked(audioDuration + SampleDuration(audioSample, audioMetadata.DefaultSampleDuration));
+                videoDuration = checked(videoDuration + SampleDuration(measuredSample, videoMetadata.DefaultSampleDuration));
             }
-            if (audioDuration == 0) throw new InvalidDataException("Audio track is empty.");
-
-            // Round up so the last video sample also covers the final audio sample.
-            var targetVideoDuration = checked((long)Math.Ceiling(
-                (decimal)audioDuration * videoMetadata.Timescale / audioMetadata.Timescale));
-            audioReader = CreateReader(audioContainer);
+            if (videoDuration == 0) throw new InvalidDataException("Video track is empty.");
+            var targetVideoDuration = checked(videoDuration * loopCount);
+            var targetAudioDuration = audioMetadata == null ? 0 : checked((long)Math.Ceiling(
+                (decimal)targetVideoDuration * audioMetadata.Timescale / videoMetadata.Timescale));
+            videoReader = CreateReader(videoContainer);
             byte[] audioBuffer = null, videoBuffer = null;
-            audioSample = audioReader.ReadSample(audioTrack.TrackID, ref audioBuffer, out int audioBytes);
+            int audioBytes = 0;
+            var audioSample = mp3Reader != null ? mp3Reader.ReadSample(ref audioBuffer, out audioBytes, cancellationToken)
+                : audioReader?.ReadSample(audioTrack.TrackID, ref audioBuffer, out audioBytes);
+            if (audioTrack != null && audioSample == null) throw new InvalidDataException("Audio track is empty.");
             var firstVideoSample = videoReader.ReadSample(videoTrack.TrackID, ref videoBuffer, out int videoBytes);
             if (firstVideoSample == null || !firstVideoSample.IsRandomAccessPoint)
                 throw new InvalidDataException("The video track must begin with a keyframe.");
@@ -65,9 +78,10 @@ namespace SharpMP4.Builders
             using var builder = new Mp4Builder(new SingleStreamOutput(outputStream));
             if (temporaryStorageFactory != null) builder.TemporaryStorageFactory = temporaryStorageFactory;
             var outputVideoTrack = new PassthroughTrack(videoTrack, videoMetadata);
-            var outputAudioTrack = new PassthroughTrack(audioTrack, audioMetadata);
+            ITrack outputAudioTrack = audioTrack == null ? null : mp3Reader != null ? audioTrack
+                : new PassthroughTrack(audioTrack, audioMetadata);
             builder.AddTrack(outputVideoTrack);
-            builder.AddTrack(outputAudioTrack, audioSampleCount);
+            if (outputAudioTrack != null) builder.AddTrack(outputAudioTrack);
 
             long videoWritten = 0;
             long audioWritten = 0;
@@ -97,11 +111,14 @@ namespace SharpMP4.Builders
                 }
                 else if (audioSample != null)
                 {
-                    var duration = SampleDuration(audioSample, audioMetadata.DefaultSampleDuration);
+                    var duration = (int)Math.Min(SampleDuration(audioSample, audioMetadata.DefaultSampleDuration),
+                        targetAudioDuration - audioWritten);
                     builder.ProcessRawSample(outputAudioTrack.TrackID, audioSample.Data, 0, audioBytes, duration,
                         audioSample.IsRandomAccessPoint, audioSample.PTS - audioSample.DTS);
                     audioWritten += duration;
-                    audioSample = audioReader.ReadSample(audioTrack.TrackID, ref audioBuffer, out audioBytes);
+                    audioSample = audioWritten >= targetAudioDuration ? null
+                        : mp3Reader != null ? mp3Reader.ReadSample(ref audioBuffer, out audioBytes, cancellationToken)
+                        : audioReader.ReadSample(audioTrack.TrackID, ref audioBuffer, out audioBytes);
                 }
             }
 

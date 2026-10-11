@@ -1,6 +1,7 @@
 ﻿using SharpISOBMFF;
 using SharpMP4.Common;
 using System;
+using System.Linq;
 
 namespace SharpMP4.Tracks
 {
@@ -62,6 +63,10 @@ namespace SharpMP4.Tracks
             {
                 case "esds": // mp4
                 case "wave": // quicktime
+                    var esds = sampleEntry as ESDBox ?? sampleEntry.Children?.OfType<ESDBox>().SingleOrDefault();
+                    var objectType = esds?._ES?.Children?.OfType<DecoderConfigDescriptor>().SingleOrDefault()?.ObjectTypeIndication;
+                    if (objectType == 0x69 || objectType == 0x6b)
+                        return new MP3Track(sampleEntry, timescale, sampleDuration) { TrackID = trackID };
                     return new AACTrack(sampleEntry, timescale, sampleDuration) { TrackID = trackID };
 
                 case "dOps":
