@@ -125,3 +125,7 @@ mp4Builder.Logger.IsWarnEnabled = false;
 Huge inspiration for this project was the `mp4parser` https://github.com/sannies/mp4parser, thank you very much!
 
 The library targets .NET 8 and .NET 10; .NET Framework 4.8.1 is no longer supported.
+
+Dispose the owning `IsoStream` after using its parsed data. It also closes any
+temporary storage created for non-seekable input. Returned `StreamMarker` data
+is valid only while its owning stream remains open.

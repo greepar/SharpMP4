@@ -63,6 +63,57 @@ public class StorageLifecycleTests
         Assert.False(external.IsDisposed);
     }
 
+    [Fact]
+    public void NonSeekableReaderDisposesItsTemporaryStorageWithTheInput()
+    {
+        var input = new NonSeekStream([1, 2, 3, 4]);
+        var factory = new CountingFactory();
+        var owner = new IsoStream(input, factory);
+        owner.ReadUInt8ArrayTillEnd(0, 32, out StreamMarker marker, "");
+        var temporary = Assert.Single(factory.Created);
+        Assert.False(temporary.IsDisposed);
+        marker.Stream.SeekFromBeginning(marker.Position);
+        marker.Stream.ReadBytes(4, out byte[] bytes);
+        Assert.Equal<byte>([1, 2, 3, 4], bytes);
+        owner.Dispose();
+        Assert.True(temporary.IsDisposed);
+        Assert.False(input.CanRead);
+        // Markers share their owner's lifetime; disposing either again is safe.
+        owner.Dispose();
+        marker.Dispose();
+    }
+
+    [Fact]
+    public void ReaderClosesTheInputEvenIfTemporaryStorageDisposalThrows()
+    {
+        var input = new NonSeekStream([1, 2, 3, 4]);
+        var owner = new IsoStream(input, new ThrowingFactory());
+        owner.ReadUInt8ArrayTillEnd(0, 32, out StreamMarker marker, "");
+        Assert.Throws<IOException>(() => owner.Dispose());
+        Assert.False(input.CanRead);
+        owner.Dispose();
+        marker.Dispose();
+    }
+
+    private sealed class NonSeekStream(byte[] bytes) : MemoryStream(bytes)
+    {
+        public override bool CanSeek => false;
+    }
+
+    private sealed class ThrowingFactory : ITemporaryStorageFactory
+    {
+        public IStorage Create(IMp4Logger? logger = null) => new ThrowingStorage();
+    }
+
+    private sealed class ThrowingStorage : TemporaryMemory
+    {
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            if (disposing) throw new IOException("Injected disposal failure");
+        }
+    }
+
     private static GenericTrack CreateTrack() => new(new MetaDataSampleEntry(IsoStream.FromFourCC("test"))
     {
         ReservedSampleEntry = new byte[6], DataReferenceIndex = 1

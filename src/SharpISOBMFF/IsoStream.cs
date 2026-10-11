@@ -2394,13 +2394,19 @@ namespace SharpISOBMFF
         {
             if (!_disposedValue)
             {
-                if (disposing)
+                try
                 {
-                    // TODO: dispose managed state (managed objects)
-                    _stream.Dispose();
+                    if (disposing)
+                    {
+                        try { _temp?.Dispose(); }
+                        finally
+                        {
+                            _temp = null;
+                            _stream.Dispose();
+                        }
+                    }
                 }
-
-                _disposedValue = true;
+                finally { _disposedValue = true; }
             }
         }
 
