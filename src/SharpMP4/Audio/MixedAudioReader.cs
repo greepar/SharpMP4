@@ -43,6 +43,36 @@ namespace SharpMP4.Audio
             catch { original.Dispose(); throw; }
         }
 
+        internal static void DecodeMonoPcm16(Stream input, Stream output, int sampleRate, CancellationToken cancellationToken)
+        {
+            if (sampleRate < 8000 || sampleRate > 48000) throw new ArgumentOutOfRangeException(nameof(sampleRate));
+            PcmSource source;
+            if (MP3Reader.IsMP3(input)) source = new Mp3PcmSource(input);
+            else
+            {
+                var container = new Container();
+                container.Read(new IsoStream(input));
+                source = new AacPcmSource(container);
+            }
+            using (source)
+            {
+                var resampler = new Resampler(source, sampleRate);
+                var frames = checked((long)Math.Ceiling(source.DurationSeconds * sampleRate));
+                var buffer = new byte[4096];
+                var used = 0;
+                for (long i = 0; i < frames; i++)
+                {
+                    if (used == 0) cancellationToken.ThrowIfCancellationRequested();
+                    resampler.ReadFrame(out float left, out float right);
+                    var value = (short)Math.Clamp((int)Math.Round((left + right) * .5f * 32768), short.MinValue, short.MaxValue);
+                    BinaryPrimitives.WriteInt16LittleEndian(buffer.AsSpan(used, 2), value);
+                    used += 2;
+                    if (used == buffer.Length) { output.Write(buffer, 0, used); used = 0; }
+                }
+                if (used > 0) output.Write(buffer, 0, used);
+            }
+        }
+
         public void SetVideoDuration(long duration, uint timescale, long totalSamples)
         {
             originalSamples = checked((long)Math.Ceiling((decimal)duration * 48000 / timescale));
@@ -141,7 +171,10 @@ namespace SharpMP4.Audio
                     SkipPriming();
                 }
                 var media = trackBox.Children.OfType<MediaBox>().Single().Children.OfType<MediaHeaderBox>().Single();
-                DurationSeconds = Math.Max(0, (decimal)media.Duration / media.Timescale - (decimal)primingSamples / SampleRate);
+                var movieHeader = container.Children.OfType<MovieBox>().Single().Children.OfType<MovieHeaderBox>().Single();
+                DurationSeconds = edit != null && edit.EditDuration[0] > 0
+                    ? (decimal)edit.EditDuration[0] / movieHeader.Timescale
+                    : Math.Max(0, (decimal)media.Duration / media.Timescale - (decimal)primingSamples / SampleRate);
             }
             private void SkipPriming()
             {
@@ -180,14 +213,14 @@ namespace SharpMP4.Audio
         {
             private readonly PcmSource source;
             private readonly float[] coefficients = new float[32 * 1024], ring = new float[64];
-            private readonly int rate;
+            private readonly int rate, outputRate;
             private long outputPosition, loaded = -1;
             private bool ended;
-            public Resampler(PcmSource source)
+            public Resampler(PcmSource source, int outputRate = 48000)
             {
-                this.source = source; rate = source.SampleRate;
+                this.source = source; rate = source.SampleRate; this.outputRate = outputRate;
                 if (rate < 8000 || rate > 96000) throw new NotSupportedException("Unsupported PCM sample rate.");
-                double cutoff = Math.Min(1, 48000.0 / rate) * .95;
+                double cutoff = Math.Min(1, (double)outputRate / rate) * .95;
                 for (int phase = 0; phase < 1024; phase++)
                 {
                     double sum = 0;
@@ -205,8 +238,8 @@ namespace SharpMP4.Audio
             public void ReadFrame(out float left, out float right)
             {
                 long numerator = checked(outputPosition * rate);
-                long center = numerator / 48000;
-                int phase = (int)((numerator % 48000) * 1024 / 48000);
+                long center = numerator / outputRate;
+                int phase = (int)((numerator % outputRate) * 1024 / outputRate);
                 while (loaded < center + 16)
                 {
                     float l = 0, r = 0;
