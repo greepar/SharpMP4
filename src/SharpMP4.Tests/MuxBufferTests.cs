@@ -45,6 +45,42 @@ public class MuxBufferTests
         Assert.Null(reader.ReadSample(audioTrack.TrackID));
     }
 
+    [Fact]
+    public void LoopingMuxUsesAndReleasesTheProvidedTemporaryStorage()
+    {
+        using var video = CreateInput(HandlerTypes.Video, [2], [5], [0]);
+        using var audio = CreateInput("soun", [7], [4], [0]);
+        using var output = new MemoryStream();
+        var factory = new TrackingFactory();
+        LoopingVideoAudioMuxer.Mux(video, audio, output, CancellationToken.None, factory);
+        Assert.NotNull(factory.Storage);
+        Assert.True(factory.Storage.IsDisposed);
+        Assert.True(output.CanWrite);
+        output.Position = 0;
+        var container = new Container();
+        container.Read(new IsoStream(output));
+        var reader = new VideoReader();
+        reader.Parse(container);
+        var audioTrack = reader.GetTracks().Single(t => t.HandlerType == "soun");
+        Assert.Equal<byte>([1, 1, 1, 1], reader.ReadSample(audioTrack.TrackID).Data);
+    }
+
+    private sealed class TrackingFactory : ITemporaryStorageFactory
+    {
+        public TrackingStorage? Storage { get; private set; }
+        public IStorage Create(SharpMP4.Common.IMp4Logger? logger = null) => Storage = new TrackingStorage();
+    }
+
+    private sealed class TrackingStorage : TemporaryMemory
+    {
+        public bool IsDisposed { get; private set; }
+        protected override void Dispose(bool disposing)
+        {
+            IsDisposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
     private static MemoryStream CreateInput(string handler, int[] durations, int[] sizes, long[] offsets)
     {
         var output = new MemoryStream();

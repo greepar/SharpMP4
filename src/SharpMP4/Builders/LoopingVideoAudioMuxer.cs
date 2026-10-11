@@ -1,5 +1,6 @@
 using SharpISOBMFF;
 using SharpMP4.Readers;
+using SharpMP4.Common;
 using SharpMP4.Tracks;
 using System;
 using System.IO;
@@ -16,6 +17,12 @@ namespace SharpMP4.Builders
     {
         public static void Mux(Stream videoStream, Stream audioStream, Stream outputStream,
             CancellationToken cancellationToken = default)
+        {
+            Mux(videoStream, audioStream, outputStream, cancellationToken, null);
+        }
+
+        public static void Mux(Stream videoStream, Stream audioStream, Stream outputStream,
+            CancellationToken cancellationToken, ITemporaryStorageFactory temporaryStorageFactory)
         {
             if (videoStream == null || !videoStream.CanSeek) throw new ArgumentException("Video input must be seekable.", nameof(videoStream));
             if (audioStream == null || !audioStream.CanSeek) throw new ArgumentException("Audio input must be seekable.", nameof(audioStream));
@@ -56,6 +63,7 @@ namespace SharpMP4.Builders
                 throw new InvalidDataException("The video track must begin with a keyframe.");
 
             using var builder = new Mp4Builder(new SingleStreamOutput(outputStream));
+            if (temporaryStorageFactory != null) builder.TemporaryStorageFactory = temporaryStorageFactory;
             var outputVideoTrack = new PassthroughTrack(videoTrack, videoMetadata);
             var outputAudioTrack = new PassthroughTrack(audioTrack, audioMetadata);
             builder.AddTrack(outputVideoTrack);
