@@ -87,6 +87,17 @@ namespace SharpMP4.Builders
             _trackContexts.Add(trackID, new TrackContext(track, sampleCountHint));
         }
         
+        /// <summary>Sets the presented interval after all samples have been written, without removing
+        /// decoder priming packets. The MP4 edit list skips samples outside this interval.</summary>
+        public void SetPresentationWindow(uint trackId, long start, long duration)
+        {
+            if (!_trackContexts.TryGetValue(trackId, out var track)) throw new ArgumentOutOfRangeException(nameof(trackId));
+            if (start < 0 || duration <= 0 || (ulong)checked(start + duration) > track.EndTime)
+                throw new ArgumentOutOfRangeException(nameof(duration));
+            track.PresentationStart = start;
+            track.PresentationEnd = checked(start + duration);
+        }
+
         private uint GetNextTrackId()
         {
             uint trackID = 1;

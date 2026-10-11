@@ -8,6 +8,36 @@ namespace SharpMP4.Tests;
 
 public class MuxBufferTests
 {
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    public void PreservingMuxLoopsEmbeddedAudioInsteadOfReplacingIt(int loops)
+    {
+        using var video = CreateInput(HandlerTypes.Video, [2, 3, 2], [5, 2, 4], [1, -1, 0], embeddedAudio: true);
+        using var background = CreateInput("soun", [7], [3], [0]);
+        using var output = new MemoryStream();
+        LoopingVideoAudioMuxer.MuxPreservingEmbeddedAudio(video, background, output,
+            temporaryStorageFactory: new TemporaryMemoryStorageFactory(), loopCount: loops);
+        output.Position = 0;
+        var container = new Container();
+        container.Read(new IsoStream(output));
+        var reader = new VideoReader();
+        reader.Parse(container);
+        var sound = reader.GetTracks().Single(track => track.HandlerType == "soun");
+        long written = 0;
+        for (int i = 0; i < loops * 3; i++)
+        {
+            var sample = reader.ReadSample(sound.TrackID);
+            Assert.NotNull(sample);
+            Assert.Equal(written, sample.DTS);
+            Assert.Equal(3, sample.Data.Length);
+            Assert.All(sample.Data, value => Assert.Equal((byte)(100 + i % 3), value));
+            written += sample.Duration;
+        }
+        Assert.Equal(loops * 7, written);
+        Assert.Null(reader.ReadSample(sound.TrackID));
+    }
+
     [Fact]
     public void LoopingMuxPreservesThreeLoopsVariablePayloadsAndAudioClipping()
     {
@@ -81,7 +111,7 @@ public class MuxBufferTests
         }
     }
 
-    private static MemoryStream CreateInput(string handler, int[] durations, int[] sizes, long[] offsets)
+    private static MemoryStream CreateInput(string handler, int[] durations, int[] sizes, long[] offsets, bool embeddedAudio = false)
     {
         var output = new MemoryStream();
         var track = new GenericTrack(new MetaDataSampleEntry(IsoStream.FromFourCC("test"))
@@ -93,11 +123,16 @@ public class MuxBufferTests
             TemporaryStorageFactory = new TemporaryMemoryStorageFactory()
         };
         builder.AddTrack(track, durations.Length);
+        var sound = embeddedAudio ? new GenericTrack(new MetaDataSampleEntry(IsoStream.FromFourCC("test"))
+        { ReservedSampleEntry = new byte[6], DataReferenceIndex = 1 }, 1000, 2, IsoStream.FromFourCC("soun"), "soun") : null;
+        if (sound != null) builder.AddTrack(sound, durations.Length);
         for (int i = 0; i < durations.Length; i++)
         {
             var buffer = Enumerable.Repeat((byte)(i + 1), sizes[i] + 8).ToArray();
             // Extra capacity must never become part of the media sample.
             builder.ProcessRawSample(track.TrackID, buffer, 2, sizes[i], durations[i], true, offsets[i]);
+            if (sound != null)
+                builder.ProcessRawSample(sound.TrackID, Enumerable.Repeat((byte)(100 + i), 3).ToArray(), 0, 3, durations[i], true, 0);
         }
         builder.FinalizeMedia();
         output.Position = 0;

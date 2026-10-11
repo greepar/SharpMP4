@@ -110,6 +110,8 @@ LoopingVideoAudioMuxer.Mux(video, audio, output, loopCount: 3);
 ```
 Inputs must be seekable, and the video must start with a keyframe. Pass `null` for audio to repeat only the video, or `loopCount: 1` to play it once. Long audio is trimmed at the video end; short audio ends naturally while the video continues. This is entirely managed remuxing, without ffmpeg, native codecs, or PCM conversion. It does not animate still images.
 
+Use `LoopingVideoAudioMuxer.MuxPreservingEmbeddedAudio(video, audio, output, loopCount: 3)` to preserve and repeat the video's existing audio alongside the picture. In this mode the supplied background audio is used only when the video has no embedded audio track. Encoded samples are copied without re-encoding.
+
 `MP3Reader` supports MPEG-1/2/2.5 Layer III, CBR/VBR, CRC-protected frames, ID3v2 tags (including v2.4 footers), ID3v1/APEv2 trailers, and Xing/Info/VBRI metadata frames. It reads sequentially and reuses the caller's frame buffer and the returned `MediaSample` instance; consume each sample before reading the next. Free-format MP3, malformed/truncated data, and changes of sample rate or channel count are rejected. Gapless encoder delay/padding metadata is not transferred to MP4 edit lists.
 
 An MP3-only MP4 can also be written with the normal builder:
@@ -144,3 +146,16 @@ The library targets .NET 8 and .NET 10; .NET Framework 4.8.1 is no longer suppor
 Dispose the owning `IsoStream` after using its parsed data. It also closes any
 temporary storage created for non-seekable input. Returned `StreamMarker` data
 is valid only while its owning stream remains open.
+
+### Managed original-audio and music mixing
+
+```csharp
+// AAC embedded in the video + raw MP3 or AAC-in-MP4 background music:
+LoopingVideoAudioMuxer.MuxMixingEmbeddedAudio(video, music, output, loopCount: 3);
+```
+
+This mode decodes each source incrementally, resamples mono/stereo PCM to 48 kHz stereo with a 32-tap polyphase sinc filter, mixes the two sources at equal half gain using SIMD, and encodes one AAC-LC track. Video packets are copied unchanged. Original audio repeats at each video boundary; background music continues once and is padded with silence when shorter than the video. Encoder priming is kept for decoding and hidden using an MP4 edit list. Simple input AAC edit lists are honored. If no embedded audio exists, the original remux path keeps the supplied background codec unchanged; if no background exists, embedded audio is preserved without encoding.
+
+`PcmMixer.Mix` and `ManagedAacEncoder.Encode` are also available separately. The encoder accepts interleaved float PCM, mono/stereo at 44.1/48 kHz, and emits raw 1024-sample AAC-LC access units. It uses long sine windows, spectral Huffman codebook selection and a bounded rate search, without a full psychoacoustic model. Mixing and encoding reuse fixed buffers and do not allocate per frame; the managed SharpJaad.AAC and NLayer decoders have their own reusable buffers. AAC mixing supports MP4 AAC mono/stereo; encrypted tracks and complex edit lists are rejected. No external process or native codec is used in this path. Container metadata and encoded samples use the existing temporary storage factory, preserving the bounded-memory mux behavior.
+
+See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for codec dependencies and the FFT MDCT reference license.

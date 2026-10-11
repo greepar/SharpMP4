@@ -1,4 +1,5 @@
 using SharpISOBMFF;
+using SharpMP4.Audio;
 using SharpMP4.Readers;
 using SharpMP4.Common;
 using SharpMP4.Tracks;
@@ -11,7 +12,8 @@ namespace SharpMP4.Builders
 {
     /// <summary>
     /// Repeats an MP4 video a fixed number of times, optionally with an MP4 audio track or raw MP3 stream.
-    /// Both inputs are remuxed without encoding; the first video sample must be a keyframe.
+    /// The remux variants keep compressed samples; the mixing variant encodes audio only.
+    /// The first video sample must be a keyframe.
     /// </summary>
     public static class LoopingVideoAudioMuxer
     {
@@ -30,6 +32,21 @@ namespace SharpMP4.Builders
 
         public static void Mux(Stream videoStream, Stream audioStream, Stream outputStream,
             CancellationToken cancellationToken, ITemporaryStorageFactory temporaryStorageFactory, int loopCount)
+            => MuxCore(videoStream, audioStream, outputStream, cancellationToken, temporaryStorageFactory, loopCount, false);
+
+        /// <summary>Preserves and loops embedded audio when present; otherwise uses the supplied background audio.</summary>
+        public static void MuxPreservingEmbeddedAudio(Stream videoStream, Stream audioStream, Stream outputStream,
+            CancellationToken cancellationToken = default, ITemporaryStorageFactory temporaryStorageFactory = null, int loopCount = 3)
+            => MuxCore(videoStream, audioStream, outputStream, cancellationToken, temporaryStorageFactory, loopCount, true);
+
+        /// <summary>Mixes embedded AAC with external MP3/AAC using managed streaming DSP and AAC encoding.
+        /// Video samples are copied unchanged. Without embedded audio, background audio is remuxed unchanged.</summary>
+        public static void MuxMixingEmbeddedAudio(Stream videoStream, Stream audioStream, Stream outputStream,
+            CancellationToken cancellationToken = default, ITemporaryStorageFactory temporaryStorageFactory = null, int loopCount = 3)
+            => MuxCore(videoStream, audioStream, outputStream, cancellationToken, temporaryStorageFactory, loopCount, true, true);
+
+        private static void MuxCore(Stream videoStream, Stream audioStream, Stream outputStream,
+            CancellationToken cancellationToken, ITemporaryStorageFactory temporaryStorageFactory, int loopCount, bool preferEmbeddedAudio, bool mixEmbeddedAudio = false)
         {
             if (videoStream == null || !videoStream.CanSeek) throw new ArgumentException("Video input must be seekable.", nameof(videoStream));
             if (audioStream != null && !audioStream.CanSeek) throw new ArgumentException("Audio input must be seekable.", nameof(audioStream));
@@ -38,17 +55,22 @@ namespace SharpMP4.Builders
             if (loopCount < 1) throw new ArgumentOutOfRangeException(nameof(loopCount));
             cancellationToken.ThrowIfCancellationRequested();
             var videoContainer = ReadContainer(videoStream, temporaryStorageFactory);
-            var mp3Reader = audioStream != null && MP3Reader.IsMP3(audioStream) ? new MP3Reader(audioStream) : null;
-            var audioContainer = audioStream == null || mp3Reader != null ? null : ReadContainer(audioStream, temporaryStorageFactory);
             var videoReader = CreateReader(videoContainer);
+            var embeddedAudio = preferEmbeddedAudio
+                ? videoReader.GetTracks().FirstOrDefault(track => track.HandlerType == "soun") : null;
+            using var mixedReader = mixEmbeddedAudio && embeddedAudio != null && audioStream != null
+                ? new MixedAudioReader(videoContainer, audioStream, temporaryStorageFactory) : null;
+            var mp3Reader = embeddedAudio == null && audioStream != null && MP3Reader.IsMP3(audioStream) ? new MP3Reader(audioStream) : null;
+            var audioContainer = mixedReader != null ? null : embeddedAudio != null ? videoContainer
+                : audioStream == null || mp3Reader != null ? null : ReadContainer(audioStream, temporaryStorageFactory);
             var audioReader = audioContainer == null ? null : CreateReader(audioContainer);
             var videoTrack = videoReader.GetTracks().FirstOrDefault(track => track.HandlerType == "vide")
                              ?? throw new InvalidDataException("Video input has no video track.");
-            ITrack audioTrack = mp3Reader != null ? mp3Reader.Track
+            ITrack audioTrack = mixedReader != null ? mixedReader.Track : mp3Reader != null ? mp3Reader.Track
                 : audioReader?.GetTracks().FirstOrDefault(track => track.HandlerType == "soun");
             if (audioStream != null && audioTrack == null) throw new InvalidDataException("Audio input has no audio track.");
             var videoMetadata = GetTrackMetadata(videoContainer, "vide", videoTrack);
-            var audioMetadata = audioTrack == null ? null : mp3Reader != null
+            var audioMetadata = audioTrack == null ? null : mixedReader != null || mp3Reader != null
                 ? new TrackMetadata(null, audioTrack.Timescale, audioTrack.DefaultSampleDuration)
                 : GetTrackMetadata(audioContainer, "soun", audioTrack);
             if (videoMetadata.Timescale == 0 || audioMetadata?.Timescale == 0)
@@ -65,10 +87,14 @@ namespace SharpMP4.Builders
             var targetVideoDuration = checked(videoDuration * loopCount);
             var targetAudioDuration = audioMetadata == null ? 0 : checked((long)Math.Ceiling(
                 (decimal)targetVideoDuration * audioMetadata.Timescale / videoMetadata.Timescale));
+            mixedReader?.SetVideoDuration(videoDuration, videoMetadata.Timescale, targetAudioDuration);
+            // Keep the encoder's first overlap packet and skip its 1024-sample delay with an edit list.
+            var presentedAudioDuration = targetAudioDuration;
+            if (mixedReader != null) targetAudioDuration = checked(targetAudioDuration + ManagedAacEncoder.FrameSamples);
             videoReader = CreateReader(videoContainer);
             byte[] audioBuffer = null, videoBuffer = null;
             int audioBytes = 0;
-            var audioSample = mp3Reader != null ? mp3Reader.ReadSample(ref audioBuffer, out audioBytes, cancellationToken)
+            var audioSample = mixedReader != null ? mixedReader.ReadSample(ref audioBuffer, out audioBytes, cancellationToken) : mp3Reader != null ? mp3Reader.ReadSample(ref audioBuffer, out audioBytes, cancellationToken)
                 : audioReader?.ReadSample(audioTrack.TrackID, ref audioBuffer, out audioBytes);
             if (audioTrack != null && audioSample == null) throw new InvalidDataException("Audio track is empty.");
             var firstVideoSample = videoReader.ReadSample(videoTrack.TrackID, ref videoBuffer, out int videoBytes);
@@ -78,7 +104,7 @@ namespace SharpMP4.Builders
             using var builder = new Mp4Builder(new SingleStreamOutput(outputStream));
             if (temporaryStorageFactory != null) builder.TemporaryStorageFactory = temporaryStorageFactory;
             var outputVideoTrack = new PassthroughTrack(videoTrack, videoMetadata);
-            ITrack outputAudioTrack = audioTrack == null ? null : mp3Reader != null ? audioTrack
+            ITrack outputAudioTrack = audioTrack == null ? null : mixedReader != null || mp3Reader != null ? audioTrack
                 : new PassthroughTrack(audioTrack, audioMetadata);
             builder.AddTrack(outputVideoTrack);
             if (outputAudioTrack != null) builder.AddTrack(outputAudioTrack);
@@ -117,11 +143,20 @@ namespace SharpMP4.Builders
                         audioSample.IsRandomAccessPoint, audioSample.PTS - audioSample.DTS);
                     audioWritten += duration;
                     audioSample = audioWritten >= targetAudioDuration ? null
+                        : mixedReader != null ? mixedReader.ReadSample(ref audioBuffer, out audioBytes, cancellationToken)
                         : mp3Reader != null ? mp3Reader.ReadSample(ref audioBuffer, out audioBytes, cancellationToken)
                         : audioReader.ReadSample(audioTrack.TrackID, ref audioBuffer, out audioBytes);
+                    if (audioSample == null && embeddedAudio != null && mixedReader == null && audioWritten < targetAudioDuration)
+                    {
+                        audioReader = CreateReader(audioContainer);
+                        audioSample = audioReader.ReadSample(audioTrack.TrackID, ref audioBuffer, out audioBytes);
+                        if (audioSample == null) throw new InvalidDataException("Embedded audio track cannot be looped.");
+                    }
                 }
             }
 
+            if (mixedReader != null)
+                builder.SetPresentationWindow(outputAudioTrack.TrackID, ManagedAacEncoder.FrameSamples, presentedAudioDuration);
             builder.FinalizeMedia();
         }
 
