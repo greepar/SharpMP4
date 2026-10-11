@@ -17,11 +17,12 @@ namespace SharpMP4.Audio
         public AACTrack Track { get; } = new AACTrack(2, 48000, 16);
         private readonly AacPcmSource original;
         private readonly PcmSource background;
-        private Resampler originalResampler;
+        private readonly Resampler originalResampler;
         private readonly Resampler backgroundResampler;
         private readonly ManagedAacEncoder encoder = new ManagedAacEncoder();
         private readonly float[] originalPcm = new float[2048], musicPcm = new float[2048];
-        private long position, loopSamples, totalSamples;
+        private long position, originalSamples, totalSamples;
+        public decimal BackgroundDurationSeconds => background.DurationSeconds;
         private readonly MediaSample sample = new MediaSample(0, 0, 1024, null);
 
         public MixedAudioReader(Container video, Stream music, ITemporaryStorageFactory temporaryStorageFactory)
@@ -44,14 +45,14 @@ namespace SharpMP4.Audio
 
         public void SetVideoDuration(long duration, uint timescale, long totalSamples)
         {
-            loopSamples = checked((long)Math.Ceiling((decimal)duration * 48000 / timescale));
+            originalSamples = checked((long)Math.Ceiling((decimal)duration * 48000 / timescale));
             this.totalSamples = totalSamples;
         }
 
         public MediaSample ReadSample(ref byte[] output, out int bytes, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (loopSamples <= 0) throw new InvalidOperationException("Video duration must be set before reading mixed audio.");
+            if (originalSamples <= 0) throw new InvalidOperationException("Video duration must be set before reading mixed audio.");
             for (int i = 0; i < 1024; i++)
             {
                 if (position >= totalSamples)
@@ -60,12 +61,10 @@ namespace SharpMP4.Audio
                     position++;
                     continue;
                 }
-                if (position != 0 && position % loopSamples == 0)
-                {
-                    original.Reset();
-                    originalResampler.Reset();
-                }
-                originalResampler.ReadFrame(out originalPcm[2 * i], out originalPcm[2 * i + 1]);
+                if (position < originalSamples)
+                    originalResampler.ReadFrame(out originalPcm[2 * i], out originalPcm[2 * i + 1]);
+                else
+                    originalPcm[2 * i] = originalPcm[2 * i + 1] = 0;
                 backgroundResampler.ReadFrame(out musicPcm[2 * i], out musicPcm[2 * i + 1]);
                 position++;
             }
@@ -81,6 +80,7 @@ namespace SharpMP4.Audio
         private abstract class PcmSource : IDisposable
         {
             public abstract int SampleRate { get; }
+            public abstract decimal DurationSeconds { get; }
             public abstract bool ReadFrame(out float left, out float right);
             public virtual void Dispose() { }
         }
@@ -90,6 +90,7 @@ namespace SharpMP4.Audio
             private readonly float[] buffer = new float[4096];
             private int count, cursor;
             public override int SampleRate => decoder.SampleRate;
+            public override decimal DurationSeconds => (decimal)decoder.Duration.Ticks / TimeSpan.TicksPerSecond;
             public Mp3PcmSource(Stream stream)
             {
                 decoder = new NLayer.MpegFile(stream);
@@ -114,6 +115,7 @@ namespace SharpMP4.Audio
             private byte[] encoded;
             private int cursor, length;
             private readonly long primingSamples;
+            public override decimal DurationSeconds { get; }
             public override int SampleRate => pcm.SampleRate > 0 ? pcm.SampleRate : (int)track.SamplingRate;
             public AacPcmSource(Container container)
             {
@@ -138,6 +140,8 @@ namespace SharpMP4.Audio
                     if (primingSamples > SampleRate * 10L) throw new InvalidDataException("AAC priming interval is too large.");
                     SkipPriming();
                 }
+                var media = trackBox.Children.OfType<MediaBox>().Single().Children.OfType<MediaHeaderBox>().Single();
+                DurationSeconds = Math.Max(0, (decimal)media.Duration / media.Timescale - (decimal)primingSamples / SampleRate);
             }
             private void SkipPriming()
             {

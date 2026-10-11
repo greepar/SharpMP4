@@ -40,6 +40,7 @@ namespace SharpMP4.Builders
             => MuxCore(videoStream, audioStream, outputStream, cancellationToken, temporaryStorageFactory, loopCount, true);
 
         /// <summary>Mixes embedded AAC with external MP3/AAC using managed streaming DSP and AAC encoding.
+        /// Embedded audio plays once; the picture loops for at least loopCount passes and until background music ends.
         /// Video samples are copied unchanged. Without embedded audio, background audio is remuxed unchanged.</summary>
         public static void MuxMixingEmbeddedAudio(Stream videoStream, Stream audioStream, Stream outputStream,
             CancellationToken cancellationToken = default, ITemporaryStorageFactory temporaryStorageFactory = null, int loopCount = 3)
@@ -85,6 +86,9 @@ namespace SharpMP4.Builders
             }
             if (videoDuration == 0) throw new InvalidDataException("Video track is empty.");
             var targetVideoDuration = checked(videoDuration * loopCount);
+            if (mixedReader != null)
+                targetVideoDuration = Math.Max(targetVideoDuration, checked((long)Math.Ceiling(
+                    mixedReader.BackgroundDurationSeconds * videoMetadata.Timescale)));
             var targetAudioDuration = audioMetadata == null ? 0 : checked((long)Math.Ceiling(
                 (decimal)targetVideoDuration * audioMetadata.Timescale / videoMetadata.Timescale));
             mixedReader?.SetVideoDuration(videoDuration, videoMetadata.Timescale, targetAudioDuration);
