@@ -28,8 +28,8 @@ namespace SharpMP4.Builders
             if (audioStream == null || !audioStream.CanSeek) throw new ArgumentException("Audio input must be seekable.", nameof(audioStream));
             if (outputStream == null || !outputStream.CanWrite) throw new ArgumentException("Output must be writable.", nameof(outputStream));
 
-            var videoContainer = ReadContainer(videoStream);
-            var audioContainer = ReadContainer(audioStream);
+            var videoContainer = ReadContainer(videoStream, temporaryStorageFactory);
+            var audioContainer = ReadContainer(audioStream, temporaryStorageFactory);
             var videoReader = CreateReader(videoContainer);
             var audioReader = CreateReader(audioContainer);
             var videoTrack = videoReader.GetTracks().FirstOrDefault(track => track.HandlerType == "vide")
@@ -115,10 +115,10 @@ namespace SharpMP4.Builders
             return duration;
         }
 
-        private static Container ReadContainer(Stream stream)
+        private static Container ReadContainer(Stream stream, ITemporaryStorageFactory temporaryStorageFactory)
         {
             var container = new Container();
-            container.Read(new IsoStream(stream));
+            container.Read(new IsoStream(stream, temporaryStorageFactory));
             return container;
         }
 

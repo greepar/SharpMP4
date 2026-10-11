@@ -153,7 +153,8 @@ namespace SharpISOBMFF
             // NOTE: Make sure to only log if the user actually passed a valid logger
             logger?.LogInfo($"Temporary Storage: Using {nameof(TemporaryFile)}");
             
-            _stream = File.Create(Path.GetRandomFileName(), 1024, FileOptions.DeleteOnClose);
+            _stream = new FileStream(Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()),
+                FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 1024, FileOptions.DeleteOnClose);
 
             Logger = logger ?? new DefaultMp4Logger();
         }

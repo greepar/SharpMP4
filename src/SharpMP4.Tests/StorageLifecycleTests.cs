@@ -10,6 +10,23 @@ namespace SharpMP4.Tests;
 public class StorageLifecycleTests
 {
     [Fact]
+    public void DefaultTemporaryFileUsesSystemTempAndDeletesOnDispose()
+    {
+        string path;
+        using (var storage = new TemporaryFile())
+        {
+            path = ((FileStream)storage.Stream).Name;
+            Assert.Equal(Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar),
+                Path.GetDirectoryName(path));
+            Assert.True(File.Exists(path));
+            storage.WriteByte(42);
+            storage.SeekFromBeginning(0);
+            Assert.Equal(42, storage.ReadByte());
+        }
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
     public void FragmentStorageIsCreatedPerFragmentAndDisposedAfterWriting()
     {
         using var output = new MemoryStream();
