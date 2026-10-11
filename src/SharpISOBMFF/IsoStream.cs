@@ -3,6 +3,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Buffers;
+using System.Buffers.Binary;
 
 namespace SharpISOBMFF
 {
@@ -169,6 +171,57 @@ namespace SharpISOBMFF
             return correctedLength << 3;
         }
 
+        /// <summary>Reads bytes directly into a caller-owned buffer.</summary>
+        public ulong ReadBytes(int count, byte[] buffer, int offset)
+        {
+            if (buffer == null) throw new ArgumentNullException(nameof(buffer));
+            if (offset < 0 || count < 0 || offset > buffer.Length - count)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            if (CanStreamSeek() && count > GetStreamLength() - GetCurrentOffset())
+                throw new IsoEndOfStreamException(new StreamMarker(GetCurrentOffset(), GetStreamLength(), this));
+            _stream.ReadExactly(buffer, offset, count);
+            return (ulong)count << 3;
+        }
+
+        public ulong ReadBytes(Span<byte> buffer)
+        {
+            if (CanStreamSeek() && buffer.Length > GetStreamLength() - GetCurrentOffset())
+                throw new IsoEndOfStreamException(new StreamMarker(GetCurrentOffset(), GetStreamLength(), this));
+            if (_stream is ISpanStorage spanStorage)
+                spanStorage.ReadExactly(buffer);
+            else
+            {
+                byte[] temporary = ArrayPool<byte>.Shared.Rent(buffer.Length);
+                try
+                {
+                    _stream.ReadExactly(temporary, 0, buffer.Length);
+                    temporary.AsSpan(0, buffer.Length).CopyTo(buffer);
+                }
+                finally { ArrayPool<byte>.Shared.Return(temporary); }
+            }
+            return (ulong)buffer.Length << 3;
+        }
+
+        public ulong WriteBytes(ReadOnlySpan<byte> buffer)
+        {
+            if (_stream is ISpanStorage spanStorage) spanStorage.Write(buffer);
+            else if (buffer.Length <= 8)
+            {
+                for (int i = 0; i < buffer.Length; i++) _stream.WriteByte(buffer[i]);
+            }
+            else
+            {
+                byte[] temporary = ArrayPool<byte>.Shared.Rent(buffer.Length);
+                try
+                {
+                    buffer.CopyTo(temporary);
+                    _stream.Write(temporary, 0, buffer.Length);
+                }
+                finally { ArrayPool<byte>.Shared.Return(temporary); }
+            }
+            return (ulong)buffer.Length << 3;
+        }
+
         public ulong WriteBytes(ulong count, byte[] value)
         {
             //for (ulong i = 0; i < count; i++)
@@ -181,29 +234,33 @@ namespace SharpISOBMFF
 
         private static ulong CopyStream(IStorage input, IStorage output, long bytes = -1)
         {
-            byte[] buffer = new byte[32768];
-            int read;
-            ulong size = 0;
-            if (bytes < 0)
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(32768);
+            try
             {
-                while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                int read;
+                ulong size = 0;
+                if (bytes < 0)
                 {
-                    output.Write(buffer, 0, read);
-                    bytes -= read;
-                    size += (ulong)read;
+                    while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        output.Write(buffer, 0, read);
+                        bytes -= read;
+                        size += (ulong)read;
+                    }
                 }
-            }
-            else
-            {
-                while (bytes > 0 && (read = input.Read(buffer, 0, (int)Math.Min(buffer.Length, bytes))) > 0)
+                else
                 {
-                    output.Write(buffer, 0, read);
-                    bytes -= read;
-                    size += (ulong)read;
+                    while (bytes > 0 && (read = input.Read(buffer, 0, (int)Math.Min(buffer.Length, bytes))) > 0)
+                    {
+                        output.Write(buffer, 0, read);
+                        bytes -= read;
+                        size += (ulong)read;
+                    }
                 }
-            }
 
-            return size;
+                return size;
+            }
+            finally { ArrayPool<byte>.Shared.Return(buffer); }
         }
 
         #endregion // Basic read/write operations
@@ -1901,49 +1958,43 @@ namespace SharpISOBMFF
             return size;
         }
 
+        private void ReadScalarBytes(Span<byte> buffer)
+        {
+            int read = 0;
+            while (read < buffer.Length)
+            {
+                int n;
+                if (_stream is ISpanStorage spanStorage)
+                    n = spanStorage.Read(buffer.Slice(read));
+                else
+                {
+                    int value = _stream.ReadByte();
+                    n = value < 0 ? 0 : 1;
+                    if (n != 0) buffer[read] = (byte)value;
+                }
+                if (n == 0)
+                {
+                    if (read == 0) throw new IsoEndOfStreamException();
+                    throw new IsoEndOfStreamException(buffer.Slice(0, read).ToArray());
+                }
+                read += n;
+            }
+        }
+
         public ulong ReadUInt32(ulong boxSize, ulong readSize, out uint value, string name)
         {
-            int b1 = ReadByteInternal();
-            if(b1 == -1) 
-            { 
-                throw new IsoEndOfStreamException();
-            }
-
-            int b2 = ReadByteInternal();
-            if(b2 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1 });
-            }
-
-            int b3 = ReadByteInternal();
-            if (b3 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1, (byte)b2 });
-            }
-
-            int b4 = ReadByteInternal();
-            if (b4 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1, (byte)b2, (byte)b3 });
-            }
-
-            value = (uint)(
-                ((uint)b1 << 24) +
-                ((uint)b2 << 16) +
-                ((uint)b3 << 8) +
-                ((uint)b4)
-            );
-
+            Span<byte> buffer = stackalloc byte[4];
+            ReadScalarBytes(buffer);
+            value = BinaryPrimitives.ReadUInt32BigEndian(buffer);
             LogEnd(name, 32, value);
             return 32;
         }
 
         public ulong WriteUInt32(uint value, string name)
         {
-            WriteByte((byte)(value >> 24 & 0xFF));
-            WriteByte((byte)(value >> 16 & 0xFF));
-            WriteByte((byte)(value >> 8 & 0xFF));
-            WriteByte((byte)(value & 0xFF));
+            Span<byte> buffer = stackalloc byte[4];
+            BinaryPrimitives.WriteUInt32BigEndian(buffer, value);
+            WriteBytes(buffer);
             LogEnd(name, 32, value);
             return 32;
         }
@@ -1958,12 +2009,7 @@ namespace SharpISOBMFF
 
         public ulong WriteUInt32(ulong value, string name)
         {
-            WriteByte((byte)(value >> 24 & 0xFF));
-            WriteByte((byte)(value >> 16 & 0xFF));
-            WriteByte((byte)(value >> 8 & 0xFF));
-            WriteByte((byte)(value & 0xFF));
-            LogEnd(name, 32, value);
-            return 32;
+            return WriteUInt32(unchecked((uint)value), name);
         }
 
         public ulong ReadUInt48(ulong boxSize, ulong readSize, out ulong value, string name)
@@ -2047,80 +2093,18 @@ namespace SharpISOBMFF
 
         public ulong ReadUInt64(ulong boxSize, ulong readSize, out ulong value, string name)
         {
-            int b1 = ReadByteInternal();
-            if (b1 == -1)
-            {
-                throw new IsoEndOfStreamException();
-            }
-
-            int b2 = ReadByteInternal();
-            if (b2 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1 });
-            }
-
-            int b3 = ReadByteInternal();
-            if (b3 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1, (byte)b2 });
-            }
-
-            int b4 = ReadByteInternal();
-            if (b4 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1, (byte)b2, (byte)b3 });
-            }
-
-            int b5 = ReadByteInternal();
-            if (b5 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1, (byte)b2, (byte)b3, (byte)b4 });
-            }
-
-            int b6 = ReadByteInternal();
-            if (b6 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1, (byte)b2, (byte)b3, (byte)b4, (byte)b5 });
-            }
-
-            int b7 = ReadByteInternal();
-            if (b7 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1, (byte)b2, (byte)b3, (byte)b4, (byte)b5, (byte)b6 });
-            }
-
-            int b8 = ReadByteInternal();
-            if (b8 == -1)
-            {
-                throw new IsoEndOfStreamException(new byte[] { (byte)b1, (byte)b2, (byte)b3, (byte)b4, (byte)b5, (byte)b6, (byte)b7 });
-            }
-
-            value = (ulong)(
-                ((ulong)b1 << 56) +
-                ((ulong)b2 << 48) +
-                ((ulong)b3 << 40) +
-                ((ulong)b4 << 32) +
-                ((ulong)b5 << 24) +
-                ((ulong)b6 << 16) +
-                ((ulong)b7 << 8) +
-                ((ulong)b8)
-            );
-
+            Span<byte> buffer = stackalloc byte[8];
+            ReadScalarBytes(buffer);
+            value = BinaryPrimitives.ReadUInt64BigEndian(buffer);
             LogEnd(name, 64, value);
             return 64;
         }
 
         public ulong WriteUInt64(ulong value, string name)
         {
-            WriteByte((byte)(value >> 56 & 0xFF));
-            WriteByte((byte)(value >> 48 & 0xFF));
-            WriteByte((byte)(value >> 40 & 0xFF));
-            WriteByte((byte)(value >> 32 & 0xFF));
-            WriteByte((byte)(value >> 24 & 0xFF));
-            WriteByte((byte)(value >> 16 & 0xFF));
-            WriteByte((byte)(value >> 8 & 0xFF));
-            WriteByte((byte)(value & 0xFF));
-
+            Span<byte> buffer = stackalloc byte[8];
+            BinaryPrimitives.WriteUInt64BigEndian(buffer, value);
+            WriteBytes(buffer);
             LogEnd(name, 64, value);
             return 64;
         }
@@ -2529,25 +2513,4 @@ namespace SharpISOBMFF
         }
     }
 
-#if !NET7_0_OR_GREATER
-    public static class StreamExtensions
-    {
-        public static int ReadExactly(this Stream stream, byte[] buffer, int offset, int count)
-        {
-            int totalRead = 0;
-            while (totalRead < count)
-            {
-                int read = stream.Read(buffer, offset + totalRead, count - totalRead);
-                if (read == 0)
-                {
-                    return totalRead;
-                }
-
-                totalRead += read;
-            }
-
-            return totalRead;
-        }
-    }
-#endif
 }

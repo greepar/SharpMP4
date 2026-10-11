@@ -36,6 +36,30 @@ MediaSample sample = videoReader.ReadSample(trackID);
 ```
 Where `trackID` is the ID of the track you want to read.
 
+For sequential remuxing, reuse a caller-owned sample buffer:
+```cs
+byte[] buffer = null;
+int bytesRead;
+while ((sample = videoReader.ReadSample(trackID, ref buffer, out bytesRead)) != null)
+{
+    // Consume only buffer[0..bytesRead] before reading the next sample.
+    builder.ProcessRawSample(outputTrackID, buffer, 0, bytesRead,
+        sample.Duration, sample.IsRandomAccessPoint, sample.PTS - sample.DTS);
+}
+```
+The original `ReadSample(trackID)` still returns an independent, exact-length array.
+`ReadSample(trackID, false)` reads timing/flags with empty data and skips media I/O.
+H.264/H.265/H.266 tracks also provide `ParseSampleSlices(sample)`, returning
+`ReadOnlyMemory<byte>` NALUs backed by the sample without payload copies; keep the
+sample unchanged while using these slices. Invalid NAL lengths throw `InvalidDataException`.
+
+Concrete builders implement `IDisposable`. Use `using` to release their temporary
+storage if processing fails or is cancelled. `FinalizeMedia()` also releases
+factory-created storage; explicitly supplied storage remains owned by the caller.
+`Mp4Builder.AddTrack(track, sampleCountHint)` reserves sample table capacity when
+the sample count is known. `TemporaryMemoryStorageFactory(initialCapacity)` can
+reserve bytes when memory storage is explicitly desired.
+
 ## Build MP4
 To write `MP4` into a file, you first have to create the file:
 ```cs
@@ -99,3 +123,5 @@ mp4Builder.Logger.IsWarnEnabled = false;
 
 ## Credits
 Huge inspiration for this project was the `mp4parser` https://github.com/sannies/mp4parser, thank you very much!
+
+The library targets .NET 8 and .NET 10; .NET Framework 4.8.1 is no longer supported.

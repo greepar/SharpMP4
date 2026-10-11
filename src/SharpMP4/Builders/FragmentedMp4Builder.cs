@@ -10,7 +10,7 @@ namespace SharpMP4.Builders
     /// <summary>
     /// Creates Fragmented MP4.
     /// </summary>
-    public class FragmentedMp4Builder : IMp4Builder
+    public class FragmentedMp4Builder : IMp4Builder, IDisposable
     {
         private class MediaFragment
         {
@@ -74,8 +74,10 @@ namespace SharpMP4.Builders
         private readonly Dictionary<uint, TrackContext> _trackContexts = new Dictionary<uint, TrackContext>();
         
         private uint _moofSequenceNumber = 1;
+        private readonly HashSet<IStorage> _ownedStorage = new HashSet<IStorage>();
 
         public IMp4Logger Logger { get; set; } = new DefaultMp4Logger();
+        public ITemporaryStorageFactory TemporaryStorageFactory { get; set; } = new TemporaryFileStorageFactory();
 
         /// <summary>
         /// Ctor.
@@ -100,7 +102,9 @@ namespace SharpMP4.Builders
         {
             uint trackID = GetNextTrackId();
             track.TrackID = trackID;
-            _trackContexts.Add(trackID, new TrackContext(track));
+            var storage = TemporaryStorageFactory.Create();
+            _ownedStorage.Add(storage);
+            _trackContexts.Add(trackID, new TrackContext(track, storage));
         }
 
         private uint GetNextTrackId()
@@ -123,15 +127,23 @@ namespace SharpMP4.Builders
 
         public void ProcessRawSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint)
         {
-            ProcessRawSample(trackID, sample, sampleDuration, isRandomAccessPoint, new TemporaryFileStorageFactory());
+            ProcessRawSample(trackID, sample, sampleDuration, isRandomAccessPoint, TemporaryStorageFactory);
         }
 
         public void ProcessRawSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint, ITemporaryStorageFactory temporaryStorageFactory)
         {
-            ProcessRawSample(trackID, sample, sampleDuration, isRandomAccessPoint, temporaryStorageFactory.Create());
+            if (temporaryStorageFactory == null) throw new ArgumentNullException(nameof(temporaryStorageFactory));
+            ProcessRawSampleCore(trackID, sample, sampleDuration, isRandomAccessPoint, temporaryStorageFactory, null);
         }
 
         public void ProcessRawSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint, IStorage storage)
+        {
+            if (storage == null) throw new ArgumentNullException(nameof(storage));
+            ProcessRawSampleCore(trackID, sample, sampleDuration, isRandomAccessPoint, null, storage);
+        }
+
+        private void ProcessRawSampleCore(uint trackID, byte[] sample, int sampleDuration,
+            bool isRandomAccessPoint, ITemporaryStorageFactory factory, IStorage storage)
         {
             TrackContext track = _trackContexts[trackID];
             uint currentSampleDuration = sampleDuration < 0 ? (uint)track.Track.DefaultSampleDuration : (uint)sampleDuration;
@@ -140,10 +152,13 @@ namespace SharpMP4.Builders
 
             if (track.SampleSizes.Count > 0 && nextFragmentTime <= currentFragmentTime)
             {
+                // Allocate only when starting a new fragment, never once per sample.
+                var nextStorage = storage ?? factory.Create();
+                if (storage == null) _ownedStorage.Add(nextStorage);
                 var fragment = CreateNewFragment(track);
                 track.ReadyFragments.Enqueue(fragment);
 
-                track.CurrentFragments = storage;
+                track.CurrentFragments = nextStorage;
                 track.StartTime = _trackContexts[trackID].EndTime;
                 track.SampleSizes.Clear();
                 track.SampleDurations.Clear();
@@ -252,19 +267,22 @@ namespace SharpMP4.Builders
                 fragment = track.ReadyFragments.Dequeue();
             }
 
-            Container fmp4 = new Container();
-            uint sequenceNumber = _moofSequenceNumber++;
-
-            CreateMediaFragmentAsync(fmp4, track.Track, fragment, sequenceNumber);
-
-            var outputStream = _output.GetStream(sequenceNumber);
-            var fragmentStream = new IsoStream(outputStream);
-
-            track.MoofOffsets.Add((ulong)fragmentStream.GetCurrentOffset());
-            track.MoofTime.Add(fragment.EndTime);
-
-            fmp4.Write(fragmentStream);
-            _output.Flush(outputStream, sequenceNumber);
+            try
+            {
+                Container fmp4 = new Container();
+                uint sequenceNumber = _moofSequenceNumber++;
+                CreateMediaFragmentAsync(fmp4, track.Track, fragment, sequenceNumber);
+                var outputStream = _output.GetStream(sequenceNumber);
+                var fragmentStream = new IsoStream(outputStream);
+                track.MoofOffsets.Add((ulong)fragmentStream.GetCurrentOffset());
+                track.MoofTime.Add(fragment.EndTime);
+                fmp4.Write(fragmentStream);
+                _output.Flush(outputStream, sequenceNumber);
+            }
+            finally
+            {
+                if (_ownedStorage.Remove(fragment.Storage)) fragment.Storage.Dispose();
+            }
         }
 
         private void CreateMediaInitialization(Container fmp4)
@@ -521,7 +539,19 @@ namespace SharpMP4.Builders
             mdat.Data = new StreamMarker(0, fragment.Storage.GetLength(), new IsoStream(fragment.Storage));
         }
 
+        public void Dispose()
+        {
+            foreach (var storage in _ownedStorage) storage.Dispose();
+            _ownedStorage.Clear();
+        }
+
         public void FinalizeMedia()
+        {
+            try { FinalizeMediaCore(); }
+            finally { Dispose(); }
+        }
+
+        private void FinalizeMediaCore()
         {
             if (_trackContexts.Values.Any(x => x.CurrentFragments.GetLength() > 0))
             {

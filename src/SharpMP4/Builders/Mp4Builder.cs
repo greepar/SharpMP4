@@ -11,7 +11,7 @@ namespace SharpMP4.Builders
     /// <summary>
     /// Creates MP4.
     /// </summary>
-    public class Mp4Builder : IMp4Builder
+    public class Mp4Builder : IMp4Builder, IDisposable
     {
         private class TrackContext
         {
@@ -25,9 +25,13 @@ namespace SharpMP4.Builders
             public long PresentationStart { get; set; } = long.MaxValue;
             public long PresentationEnd { get; set; } = long.MinValue;
 
-            public TrackContext(ITrack track)
+            public TrackContext(ITrack track, int sampleCountHint)
             {
                 Track = track;
+                SampleSizes.Capacity = sampleCountHint;
+                SampleOffsets.Capacity = sampleCountHint;
+                SampleDurations.Capacity = sampleCountHint;
+                CompositionOffsets.Capacity = sampleCountHint;
             }
         }
 
@@ -36,6 +40,7 @@ namespace SharpMP4.Builders
         private readonly IMp4Output _output;
 
         private IStorage _storage;
+        private bool _ownsStorage;
 
         private readonly Dictionary<uint, TrackContext> _trackContexts = new Dictionary<uint, TrackContext>();        
 
@@ -51,7 +56,12 @@ namespace SharpMP4.Builders
         public IStorage Storage
         {
             get => _storage;
-            set => _storage = value;
+            set
+            {
+                if (ReferenceEquals(_storage, value)) return;
+                Dispose();
+                _storage = value;
+            }
         }
 
         public ITemporaryStorageFactory TemporaryStorageFactory { get; set; } = new TemporaryFileStorageFactory();
@@ -63,11 +73,18 @@ namespace SharpMP4.Builders
         /// <param name="track">Track to add: <see cref="TrackBase"/>.</param>
         public void AddTrack(ITrack track)
         {
+            AddTrack(track, 0);
+        }
+
+        /// <summary>Adds a track with an optional known sample count to avoid table growth.</summary>
+        public void AddTrack(ITrack track, int sampleCountHint)
+        {
+            if (sampleCountHint < 0) throw new ArgumentOutOfRangeException(nameof(sampleCountHint));
             track.Logger ??= this.Logger;
 
             uint trackID = GetNextTrackId();
             track.TrackID = trackID;
-            _trackContexts.Add(trackID, new TrackContext(track));
+            _trackContexts.Add(trackID, new TrackContext(track, sampleCountHint));
         }
         
         private uint GetNextTrackId()
@@ -78,8 +95,11 @@ namespace SharpMP4.Builders
             return trackID;
         }
 
-        private void WriteSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint, long compositionTimeOffset)
+        private void WriteSample(uint trackID, byte[] sample, int offset, int count, int sampleDuration, bool isRandomAccessPoint, long compositionTimeOffset)
         {
+            if (sample == null) throw new ArgumentNullException(nameof(sample));
+            if (offset < 0 || count < 0 || offset > sample.Length - count)
+                throw new ArgumentOutOfRangeException(nameof(count));
             var track = _trackContexts[trackID];
             int resolvedSampleDuration = sampleDuration <= 0 ? track.Track.DefaultSampleDuration : sampleDuration;
             if (resolvedSampleDuration <= 0)
@@ -90,12 +110,13 @@ namespace SharpMP4.Builders
             if (_storage == null)
             {
                 _storage = this.TemporaryStorageFactory.Create();
+                _ownsStorage = true;
             }
 
             uint currentSampleDuration = (uint)resolvedSampleDuration;
             track.SampleOffsets.Add((uint)_storage.GetPosition());
-            _storage.Write(sample, 0, sample.Length);
-            track.SampleSizes.Add((uint)sample.Length);
+            _storage.Write(sample, offset, count);
+            track.SampleSizes.Add((uint)count);
             track.SampleDurations.Add(currentSampleDuration);
             track.CompositionOffsets.Add(compositionTimeOffset);
             long presentationTime = checked((long)track.EndTime + compositionTimeOffset);
@@ -396,10 +417,32 @@ namespace SharpMP4.Builders
 
         public void ProcessRawSample(uint trackID, byte[] sample, int sampleDuration, bool isRandomAccessPoint, long compositionTimeOffset)
         {
-            WriteSample(trackID, sample, sampleDuration, isRandomAccessPoint, compositionTimeOffset);
+            WriteSample(trackID, sample, 0, sample.Length, sampleDuration, isRandomAccessPoint, compositionTimeOffset);
+        }
+
+        /// <summary>Writes only the valid range of a sample buffer; the buffer is not retained.</summary>
+        public void ProcessRawSample(uint trackID, byte[] sample, int offset, int count,
+            int sampleDuration, bool isRandomAccessPoint, long compositionTimeOffset = 0)
+        {
+            WriteSample(trackID, sample, offset, count, sampleDuration, isRandomAccessPoint, compositionTimeOffset);
+        }
+
+        public void Dispose()
+        {
+            if (_ownsStorage)
+            {
+                _storage.Dispose();
+                _ownsStorage = false;
+            }
         }
 
         public void FinalizeMedia()
+        {
+            try { FinalizeMediaCore(); }
+            finally { Dispose(); }
+        }
+
+        private void FinalizeMediaCore()
         {
             foreach(var track in _trackContexts.Values)
             {

@@ -21,7 +21,15 @@ namespace SharpISOBMFF
         int Read(byte[] buffer, int offset, int length);
     }
 
-    public class StreamWrapper : IStorage
+    /// <summary>Optional span I/O for storage implementations; existing IStorage implementations remain supported.</summary>
+    public interface ISpanStorage : IStorage
+    {
+        int Read(Span<byte> buffer);
+        void ReadExactly(Span<byte> buffer);
+        void Write(ReadOnlySpan<byte> buffer);
+    }
+
+    public class StreamWrapper : ISpanStorage
     {
         public Stream _stream;
         private bool _disposedValue;
@@ -33,6 +41,10 @@ namespace SharpISOBMFF
             _stream = stream ?? throw new ArgumentNullException(nameof(stream));
             Logger = logger ?? new DefaultMp4Logger();
         }
+
+        public int Read(Span<byte> buffer) => _stream.Read(buffer);
+        public void ReadExactly(Span<byte> buffer) => _stream.ReadExactly(buffer);
+        public void Write(ReadOnlySpan<byte> buffer) => _stream.Write(buffer);
 
         public void Flush()
         {
@@ -138,6 +150,15 @@ namespace SharpISOBMFF
         public override int Read(byte[] buffer, int offset, int count)
         {
             return storage.Read(buffer, offset, count);
+        }
+
+        public override int Read(Span<byte> buffer) => storage is ISpanStorage spanStorage
+            ? spanStorage.Read(buffer) : base.Read(buffer);
+
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            if (storage is ISpanStorage spanStorage) spanStorage.Write(buffer);
+            else base.Write(buffer);
         }
 
         public override long Seek(long offset, SeekOrigin origin) =>

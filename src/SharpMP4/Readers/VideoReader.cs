@@ -304,21 +304,44 @@ namespace SharpMP4.Readers
 
         public MediaSample ReadSample(uint trackID)
         {
+            return ReadSample(trackID, true);
+        }
+
+        /// <summary>Reads timing and flags; when readPayload is false Data is empty and media bytes are not read.</summary>
+        public MediaSample ReadSample(uint trackID, bool readPayload)
+        {
+            byte[] buffer = null;
+            return ReadSampleCore(trackID, readPayload, ref buffer, out _);
+        }
+
+        /// <summary>
+        /// Reads into a caller-owned buffer, growing it only when required. Only bytesRead
+        /// bytes in Data are valid. The next read using this buffer overwrites its contents.
+        /// </summary>
+        public MediaSample ReadSample(uint trackID, ref byte[] buffer, out int bytesRead)
+        {
+            return ReadSampleCore(trackID, true, ref buffer, out bytesRead);
+        }
+
+        private MediaSample ReadSampleCore(uint trackID, bool readPayload, ref byte[] buffer, out int bytesRead)
+        {
+            bytesRead = 0;
             if (this.Moov == null)
                 throw new InvalidOperationException();
 
             if (this.IsFragmented)
             {
-                return ReadFragmentedMp4Sample(trackID);
+                return ReadFragmentedMp4Sample(trackID, readPayload, ref buffer, out bytesRead);
             }
             else
             {
-                return ReadMp4Sample(trackID);
+                return ReadMp4Sample(trackID, readPayload, ref buffer, out bytesRead);
             }
         }
 
-        private MediaSample ReadMp4Sample(uint trackID)
+        private MediaSample ReadMp4Sample(uint trackID, bool readPayload, ref byte[] buffer, out int bytesRead)
         {
+            bytesRead = 0;
             var trackContext = this.Tracks[trackID];
 
             uint sttsSampleDelta = 0;
@@ -327,102 +350,90 @@ namespace SharpMP4.Readers
             if (trackContext.SizesList.Length <= sampleIndex)
                 return null;
 
-            int nextChunkIndex = 0;
-            long totalFrames = 0;
-            do
-            {
-                totalFrames = totalFrames + trackContext.FramesInChunkList[nextChunkIndex];
-                nextChunkIndex++;
-            }
-            while (totalFrames <= sampleIndex && nextChunkIndex < trackContext.FramesInChunkList.Length);
+            // Reset cursors on seek/rewind; sequential reads visit each table entry once.
+            if (!trackContext.CursorInitialized || sampleIndex < trackContext.CursorSampleIndex)
+                trackContext.ResetReadCursor();
 
-            int chunkIndex = nextChunkIndex - 1;
-            if (chunkIndex >= trackContext.ChunkAddressList.Length)
+            while (trackContext.ChunkIndex < trackContext.FramesInChunkList.Length
+                && sampleIndex >= trackContext.ChunkFirstSample + trackContext.FramesInChunkList[trackContext.ChunkIndex])
+            {
+                trackContext.ChunkFirstSample += trackContext.FramesInChunkList[trackContext.ChunkIndex++];
+                trackContext.AddressSampleIndex = trackContext.ChunkFirstSample;
+                trackContext.AddressInitialized = false;
+            }
+            if (trackContext.ChunkIndex >= trackContext.ChunkAddressList.Length)
                 return null;
-
-            long numFramesInChunk = trackContext.FramesInChunkList[chunkIndex];
-            long firstFrameInChunk = totalFrames - numFramesInChunk;
-            long startAddress = (long)trackContext.ChunkAddressList[chunkIndex];
-
-            for (int k = 0; k < numFramesInChunk; k++)
+            if (!trackContext.AddressInitialized)
             {
-                if (firstFrameInChunk + k == sampleIndex)
-                {
-                    break;
-                }
-
-                startAddress += trackContext.SizesList[firstFrameInChunk + k];
+                trackContext.SampleAddress = checked((long)trackContext.ChunkAddressList[trackContext.ChunkIndex]);
+                trackContext.AddressSampleIndex = trackContext.ChunkFirstSample;
+                trackContext.AddressInitialized = true;
             }
+            while (trackContext.AddressSampleIndex < sampleIndex)
+                trackContext.SampleAddress = checked(trackContext.SampleAddress + trackContext.SizesList[trackContext.AddressSampleIndex++]);
+            long startAddress = trackContext.SampleAddress;
 
-            long dts = 0;
-            uint remainingSamples = sampleIndex;
-            bool foundSttsRun = false;
-            for (int sttsIndex = 0; sttsIndex < trackContext.Stts.SampleCount.Length; sttsIndex++)
+            while (trackContext.SttsIndex < trackContext.Stts.SampleCount.Length
+                && sampleIndex >= trackContext.SttsFirstSample + trackContext.Stts.SampleCount[trackContext.SttsIndex])
             {
-                sttsSampleDelta = trackContext.Stts.SampleDelta[sttsIndex];
-                uint sampleCount = trackContext.Stts.SampleCount[sttsIndex];
-                if (remainingSamples < sampleCount)
-                {
-                    dts = checked(dts + checked((long)remainingSamples * sttsSampleDelta));
-                    foundSttsRun = true;
-                    break;
-                }
-
-                dts = checked(dts + checked((long)sampleCount * sttsSampleDelta));
-                remainingSamples -= sampleCount;
+                uint count = trackContext.Stts.SampleCount[trackContext.SttsIndex];
+                trackContext.SttsDts = checked(trackContext.SttsDts + checked((long)count * trackContext.Stts.SampleDelta[trackContext.SttsIndex]));
+                trackContext.SttsFirstSample += count;
+                trackContext.SttsIndex++;
             }
-            if (!foundSttsRun)
+            if (trackContext.SttsIndex >= trackContext.Stts.SampleCount.Length)
                 throw new InvalidDataException($"Sample {sampleIndex} is not covered by the stts box.");
+            sttsSampleDelta = trackContext.Stts.SampleDelta[trackContext.SttsIndex];
+            long dts = checked(trackContext.SttsDts + checked((long)(sampleIndex - trackContext.SttsFirstSample) * sttsSampleDelta));
 
             long compositionTimeOffset = 0;
             if (trackContext.Ctts != null)
             {
-                remainingSamples = sampleIndex;
-                bool foundCttsRun = false;
-                for (int cttsIndex = 0; cttsIndex < trackContext.Ctts.SampleCount.Length; cttsIndex++)
+                while (trackContext.CttsIndex < trackContext.Ctts.SampleCount.Length
+                    && sampleIndex >= trackContext.CttsFirstSample + trackContext.Ctts.SampleCount[trackContext.CttsIndex])
                 {
-                    uint sampleCount = trackContext.Ctts.SampleCount[cttsIndex];
-                    if (remainingSamples < sampleCount)
-                    {
-                        compositionTimeOffset = trackContext.Ctts.Version switch
-                        {
-                            0 => trackContext.Ctts.SampleOffset[cttsIndex],
-                            1 => trackContext.Ctts.SampleOffset0[cttsIndex],
-                            _ => throw new InvalidDataException($"Unsupported ctts version {trackContext.Ctts.Version}.")
-                        };
-                        foundCttsRun = true;
-                        break;
-                    }
-
-                    remainingSamples -= sampleCount;
+                    trackContext.CttsFirstSample += trackContext.Ctts.SampleCount[trackContext.CttsIndex++];
                 }
-                if (!foundCttsRun)
+                if (trackContext.CttsIndex >= trackContext.Ctts.SampleCount.Length)
                     throw new InvalidDataException($"Sample {sampleIndex} is not covered by the ctts box.");
+                compositionTimeOffset = trackContext.Ctts.Version switch
+                {
+                    0 => trackContext.Ctts.SampleOffset[trackContext.CttsIndex],
+                    1 => trackContext.Ctts.SampleOffset0[trackContext.CttsIndex],
+                    _ => throw new InvalidDataException($"Unsupported ctts version {trackContext.Ctts.Version}.")
+                };
             }
 
-            bool isRandomAccessPoint = true;
-            if (trackContext.Stss != null)
-            {
-                isRandomAccessPoint = trackContext.Stss.SampleNumber.Contains(sampleIndex + 1);
-            }
+            // stss entries are ordered sample numbers as specified by ISO BMFF.
+            bool isRandomAccessPoint = trackContext.Stss == null
+                || Array.BinarySearch(trackContext.Stss.SampleNumber, sampleIndex + 1) >= 0;
+
+            trackContext.CursorSampleIndex = sampleIndex;
+            trackContext.CursorInitialized = true;
 
             uint sampleSize = trackContext.SizesList[sampleIndex];
             long pts = checked(dts + compositionTimeOffset);
 
-            if (this.Mdat.Data.Stream.GetCurrentOffset() != startAddress)
+            byte[] sampleData = Array.Empty<byte>();
+            if (readPayload)
             {
-                this.Mdat.Data.Stream.SeekFromBeginning(startAddress);
+                if (this.Mdat.Data.Stream.GetCurrentOffset() != startAddress)
+                    this.Mdat.Data.Stream.SeekFromBeginning(startAddress);
+                bytesRead = checked((int)sampleSize);
+                if (buffer == null || buffer.Length < bytesRead)
+                    buffer = new byte[buffer == null ? bytesRead : Math.Max(bytesRead, buffer.Length <= int.MaxValue / 2 ? buffer.Length * 2 : bytesRead)];
+                this.Mdat.Data.Stream.ReadBytes(bytesRead, buffer, 0);
+                sampleData = buffer;
             }
-
-            ulong size = this.Mdat.Data.Stream.ReadBytes(sampleSize, out byte[] sampleData);
 
             trackContext.SampleIndex++;
 
             return new MediaSample(pts, dts, (int)sttsSampleDelta, sampleData, isRandomAccessPoint);
         }
 
-        private MediaSample ReadFragmentedMp4Sample(uint trackID)
+        private MediaSample ReadFragmentedMp4Sample(uint trackID, bool readPayload, ref byte[] buffer, out int bytesRead)
         {
+            bytesRead = 0;
             var trackContext = this.Tracks[trackID];
 
             if (trackContext.Moof == null || trackContext.SampleIndex >= trackContext.FragmentSampleCount || trackContext.SampleIndex < 0) // TODO: sample streaming backwards
@@ -484,13 +495,18 @@ namespace SharpMP4.Readers
             long pts = dts + sampleCompositionTime;
 
             long startAddress = trackContext.FragmentSampleStartAddress[trackContext.SampleIndex];
-            if (trackContext.Mdat.Data.Stream.GetCurrentOffset() != startAddress)
+            byte[] sampleData = Array.Empty<byte>();
+            if (readPayload)
             {
-                trackContext.Mdat.Data.Stream.SeekFromBeginning(startAddress);
+                if (trackContext.Mdat.Data.Stream.GetCurrentOffset() != startAddress)
+                    trackContext.Mdat.Data.Stream.SeekFromBeginning(startAddress);
+                bytesRead = checked((int)sampleSize);
+                if (buffer == null || buffer.Length < bytesRead)
+                    buffer = new byte[buffer == null ? bytesRead : Math.Max(bytesRead, buffer.Length <= int.MaxValue / 2 ? buffer.Length * 2 : bytesRead)];
+                trackContext.Mdat.Data.Stream.ReadBytes(bytesRead, buffer, 0);
+                sampleData = buffer;
             }
 
-            ulong size = trackContext.Mdat.Data.Stream.ReadBytes(sampleSize, out byte[] sampleData);
-                        
             trackContext.SampleIndex++;
             bool isRandomAccessPoint = (sampleFlags & 0x00010000) == 0;
             return new MediaSample(pts, dts, (int)sampleDuration, sampleData, isRandomAccessPoint);
@@ -515,6 +531,21 @@ namespace SharpMP4.Readers
         public uint[] SizesList { get; set; }
         public ulong[] ChunkAddressList { get; set; }
         public uint[] FramesInChunkList { get; set; }
+
+        internal bool CursorInitialized, AddressInitialized;
+        internal uint CursorSampleIndex;
+        internal int ChunkIndex, SttsIndex, CttsIndex;
+        internal long ChunkFirstSample, AddressSampleIndex, SampleAddress;
+        internal long SttsFirstSample, SttsDts, CttsFirstSample;
+
+        internal void ResetReadCursor()
+        {
+            CursorInitialized = AddressInitialized = false;
+            CursorSampleIndex = 0;
+            ChunkIndex = SttsIndex = CttsIndex = 0;
+            ChunkFirstSample = AddressSampleIndex = SampleAddress = 0;
+            SttsFirstSample = SttsDts = CttsFirstSample = 0;
+        }
 
         // fmp4
         public int FragmentIndex { get; set; }

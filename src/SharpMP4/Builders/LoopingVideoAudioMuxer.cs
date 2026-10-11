@@ -35,10 +35,12 @@ namespace SharpMP4.Builders
                 throw new InvalidDataException("Input track has no timescale.");
 
             long audioDuration = 0;
+            int audioSampleCount = 0;
             MediaSample audioSample;
-            while ((audioSample = audioReader.ReadSample(audioTrack.TrackID)) != null)
+            while ((audioSample = audioReader.ReadSample(audioTrack.TrackID, false)) != null)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                audioSampleCount = checked(audioSampleCount + 1);
                 audioDuration = checked(audioDuration + SampleDuration(audioSample, audioMetadata.DefaultSampleDuration));
             }
             if (audioDuration == 0) throw new InvalidDataException("Audio track is empty.");
@@ -47,16 +49,17 @@ namespace SharpMP4.Builders
             var targetVideoDuration = checked((long)Math.Ceiling(
                 (decimal)audioDuration * videoMetadata.Timescale / audioMetadata.Timescale));
             audioReader = CreateReader(audioContainer);
-            audioSample = audioReader.ReadSample(audioTrack.TrackID);
-            var firstVideoSample = videoReader.ReadSample(videoTrack.TrackID);
+            byte[] audioBuffer = null, videoBuffer = null;
+            audioSample = audioReader.ReadSample(audioTrack.TrackID, ref audioBuffer, out int audioBytes);
+            var firstVideoSample = videoReader.ReadSample(videoTrack.TrackID, ref videoBuffer, out int videoBytes);
             if (firstVideoSample == null || !firstVideoSample.IsRandomAccessPoint)
                 throw new InvalidDataException("The video track must begin with a keyframe.");
 
-            var builder = new Mp4Builder(new SingleStreamOutput(outputStream));
+            using var builder = new Mp4Builder(new SingleStreamOutput(outputStream));
             var outputVideoTrack = new PassthroughTrack(videoTrack, videoMetadata);
             var outputAudioTrack = new PassthroughTrack(audioTrack, audioMetadata);
             builder.AddTrack(outputVideoTrack);
-            builder.AddTrack(outputAudioTrack);
+            builder.AddTrack(outputAudioTrack, audioSampleCount);
 
             long videoWritten = 0;
             long audioWritten = 0;
@@ -71,7 +74,7 @@ namespace SharpMP4.Builders
                     if (videoSample == null)
                     {
                         videoReader = CreateReader(videoContainer);
-                        videoSample = videoReader.ReadSample(videoTrack.TrackID);
+                        videoSample = videoReader.ReadSample(videoTrack.TrackID, ref videoBuffer, out videoBytes);
                         if (videoSample == null || !videoSample.IsRandomAccessPoint)
                             throw new InvalidDataException("The video track cannot be looped from a keyframe.");
                     }
@@ -79,18 +82,18 @@ namespace SharpMP4.Builders
                     var duration = (int)Math.Min(
                         SampleDuration(videoSample, videoMetadata.DefaultSampleDuration),
                         targetVideoDuration - videoWritten);
-                    builder.ProcessRawSample(outputVideoTrack.TrackID, videoSample.Data, duration,
+                    builder.ProcessRawSample(outputVideoTrack.TrackID, videoSample.Data, 0, videoBytes, duration,
                         videoSample.IsRandomAccessPoint, videoSample.PTS - videoSample.DTS);
                     videoWritten += duration;
-                    videoSample = videoReader.ReadSample(videoTrack.TrackID);
+                    videoSample = videoReader.ReadSample(videoTrack.TrackID, ref videoBuffer, out videoBytes);
                 }
                 else if (audioSample != null)
                 {
                     var duration = SampleDuration(audioSample, audioMetadata.DefaultSampleDuration);
-                    builder.ProcessRawSample(outputAudioTrack.TrackID, audioSample.Data, duration,
+                    builder.ProcessRawSample(outputAudioTrack.TrackID, audioSample.Data, 0, audioBytes, duration,
                         audioSample.IsRandomAccessPoint, audioSample.PTS - audioSample.DTS);
                     audioWritten += duration;
-                    audioSample = audioReader.ReadSample(audioTrack.TrackID);
+                    audioSample = audioReader.ReadSample(audioTrack.TrackID, ref audioBuffer, out audioBytes);
                 }
             }
 

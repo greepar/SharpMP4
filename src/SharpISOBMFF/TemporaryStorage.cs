@@ -11,13 +11,23 @@ namespace SharpISOBMFF
 
     public class TemporaryMemoryStorageFactory : ITemporaryStorageFactory
     {
+        private readonly int _initialCapacity;
+
+        public TemporaryMemoryStorageFactory() : this(0) { }
+
+        public TemporaryMemoryStorageFactory(int initialCapacity)
+        {
+            if (initialCapacity < 0) throw new ArgumentOutOfRangeException(nameof(initialCapacity));
+            _initialCapacity = initialCapacity;
+        }
+
         public IStorage Create(IMp4Logger logger = null)
         {
-            return new TemporaryMemory(logger);
+            return new TemporaryMemory(_initialCapacity, logger);
         }
     }
 
-    public class TemporaryMemory : IStorage
+    public class TemporaryMemory : ISpanStorage
     {
         private readonly MemoryStream _stream;
 
@@ -27,9 +37,11 @@ namespace SharpISOBMFF
 
         public IMp4Logger Logger { get; set; }
 
-        public TemporaryMemory(IMp4Logger logger = null)
+        public TemporaryMemory(IMp4Logger logger = null) : this(0, logger) { }
+
+        public TemporaryMemory(int initialCapacity, IMp4Logger logger = null)
         {
-            _stream = new MemoryStream();
+            _stream = new MemoryStream(initialCapacity);
 
             Logger = logger ?? new DefaultMp4Logger();
         }
@@ -83,6 +95,10 @@ namespace SharpISOBMFF
             return Stream.Seek(offset, SeekOrigin.Begin);
         }
 
+        public int Read(Span<byte> buffer) => Stream.Read(buffer);
+        public void ReadExactly(Span<byte> buffer) => Stream.ReadExactly(buffer);
+        public void Write(ReadOnlySpan<byte> buffer) => Stream.Write(buffer);
+
         public void ReadExactly(byte[] data, int offset, int length)
         {
             Stream.ReadExactly(data, offset, length);
@@ -122,7 +138,7 @@ namespace SharpISOBMFF
         }
     }
 
-    public class TemporaryFile : IStorage
+    public class TemporaryFile : ISpanStorage
     {
         private readonly FileStream _stream;
 
@@ -190,6 +206,10 @@ namespace SharpISOBMFF
         {
             return Stream.Seek(offset, SeekOrigin.Begin);
         }
+
+        public int Read(Span<byte> buffer) => Stream.Read(buffer);
+        public void ReadExactly(Span<byte> buffer) => Stream.ReadExactly(buffer);
+        public void Write(ReadOnlySpan<byte> buffer) => Stream.Write(buffer);
 
         public void ReadExactly(byte[] data, int offset, int length)
         {
